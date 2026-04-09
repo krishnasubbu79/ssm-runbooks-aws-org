@@ -1,0 +1,89 @@
+description: Orchestrates the initial STDB organization bootstrap flow.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+  ConfigParameterName:
+    type: String
+    description: SSM Parameter Store name containing the STDB org bootstrap config.
+    default: /stdb/org/bootstrap/config
+  DiscoverRootDocumentName:
+    type: String
+    description: Name of the child Automation document that discovers the AWS Organizations root.
+    default: Discover-Root
+  EnsureOUsDocumentName:
+    type: String
+    description: Name of the child Automation document that creates or validates the configured organizational units.
+    default: Ensure-OUs
+  CreateAccountsDocumentName:
+    type: String
+    description: Name of the child Automation document that creates the configured long-lived accounts.
+    default: Create-Accounts
+  WaitForAccountCreationDocumentName:
+    type: String
+    description: Name of the child Automation document that waits for account provisioning to complete.
+    default: Wait-For-Account-Creation
+  MoveAccountsDocumentName:
+    type: String
+    description: Name of the child Automation document that moves accounts into their target organizational units.
+    default: Move-Accounts-To-OUs
+  CreateBootstrapRoleDocumentName:
+    type: String
+    description: Name of the child Automation document that creates the bootstrap role in each configured account.
+    default: Create-Bootstrap-Role
+mainSteps:
+  - name: discoverRoot
+    action: aws:executeAutomation
+    onFailure: Abort
+    nextStep: ensureOUs
+    inputs:
+      DocumentName: '{{ DiscoverRootDocumentName }}'
+      RuntimeParameters:
+        AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+  - name: ensureOUs
+    action: aws:executeAutomation
+    onFailure: Abort
+    nextStep: createAccounts
+    inputs:
+      DocumentName: '{{ EnsureOUsDocumentName }}'
+      RuntimeParameters:
+        AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+        ConfigParameterName: '{{ ConfigParameterName }}'
+  - name: createAccounts
+    action: aws:executeAutomation
+    onFailure: Abort
+    nextStep: waitForAccounts
+    inputs:
+      DocumentName: '{{ CreateAccountsDocumentName }}'
+      RuntimeParameters:
+        AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+        ConfigParameterName: '{{ ConfigParameterName }}'
+  - name: waitForAccounts
+    action: aws:executeAutomation
+    onFailure: Abort
+    nextStep: moveAccounts
+    inputs:
+      DocumentName: '{{ WaitForAccountCreationDocumentName }}'
+      RuntimeParameters:
+        AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+        ConfigParameterName: '{{ ConfigParameterName }}'
+  - name: moveAccounts
+    action: aws:executeAutomation
+    onFailure: Abort
+    nextStep: createBootstrapRole
+    inputs:
+      DocumentName: '{{ MoveAccountsDocumentName }}'
+      RuntimeParameters:
+        AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+        ConfigParameterName: '{{ ConfigParameterName }}'
+  - name: createBootstrapRole
+    action: aws:executeAutomation
+    onFailure: Abort
+    isEnd: true
+    inputs:
+      DocumentName: '{{ CreateBootstrapRoleDocumentName }}'
+      RuntimeParameters:
+        AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+        ConfigParameterName: '{{ ConfigParameterName }}'

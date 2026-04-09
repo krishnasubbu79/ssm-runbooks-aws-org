@@ -1,0 +1,87 @@
+description: Creates the configured long-lived STDB accounts if they do not already exist.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - createAccounts.CreatedAccounts
+  - createAccounts.ExistingAccounts
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+  ConfigParameterName:
+    type: String
+    description: SSM Parameter Store name containing the STDB org bootstrap config.
+mainSteps:
+  - name: createAccounts
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        ConfigParameterName: '{{ ConfigParameterName }}'
+      Script: |-
+        import json
+        import boto3
+
+        def load_config(parameter_name):
+            ssm = boto3.client("ssm")
+            response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            return json.loads(response["Parameter"]["Value"])
+
+        def list_accounts(orgs):
+            accounts = []
+            paginator = orgs.get_paginator("list_accounts")
+            for page in paginator.paginate():
+                accounts.extend(page.get("Accounts", []))
+            return accounts
+
+        def script_handler(events, context):
+            config = load_config(events["ConfigParameterName"])
+            orgs = boto3.client("organizations")
+            existing_accounts = list_accounts(orgs)
+
+            by_email = {account["Email"]: account for account in existing_accounts}
+
+            created = []
+            existing = []
+
+            role_name = config["bootstrap"]["orgAccessRoleName"]
+
+            for account in config.get("accounts", []):
+                email = account["email"]
+                name = account["name"]
+
+                current = by_email.get(email)
+                if current:
+                    existing.append({
+                        "name": current["Name"],
+                        "email": current["Email"],
+                        "accountId": current["Id"],
+                        "status": current["Status"],
+                    })
+                    continue
+
+                response = orgs.create_account(
+                    AccountName=name,
+                    Email=email,
+                    RoleName=role_name,
+                    IamUserAccessToBilling="ALLOW",
+                )
+                created.append({
+                    "name": name,
+                    "email": email,
+                    "createAccountStatusId": response["CreateAccountStatus"]["Id"],
+                })
+
+            return {
+                "CreatedAccounts": json.dumps(created),
+                "ExistingAccounts": json.dumps(existing),
+            }
+    outputs:
+      - Name: CreatedAccounts
+        Selector: $.Payload.CreatedAccounts
+        Type: String
+      - Name: ExistingAccounts
+        Selector: $.Payload.ExistingAccounts
+        Type: String

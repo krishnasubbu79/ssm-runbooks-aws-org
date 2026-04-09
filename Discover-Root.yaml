@@ -1,0 +1,44 @@
+description: Discovers the AWS Organizations root for the current organization.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - discoverRoot.RootId
+  - discoverRoot.RootArn
+  - discoverRoot.RootName
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+mainSteps:
+  - name: discoverRoot
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      Script: |-
+        import boto3
+
+        def script_handler(events, context):
+            client = boto3.client("organizations")
+            response = client.list_roots()
+            roots = response.get("Roots", [])
+            if len(roots) != 1:
+                raise ValueError(f"Expected exactly one root, found {len(roots)}")
+
+            root = roots[0]
+            return {
+                "RootId": root["Id"],
+                "RootArn": root["Arn"],
+                "RootName": root["Name"],
+            }
+    outputs:
+      - Name: RootId
+        Selector: $.Payload.RootId
+        Type: String
+      - Name: RootArn
+        Selector: $.Payload.RootArn
+        Type: String
+      - Name: RootName
+        Selector: $.Payload.RootName
+        Type: String

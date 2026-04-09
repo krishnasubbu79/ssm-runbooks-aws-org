@@ -1,0 +1,139 @@
+description: Ensures the STDB bootstrap role exists in each configured account.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - createBootstrapRole.CreatedRoles
+  - createBootstrapRole.UpdatedRoles
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+  ConfigParameterName:
+    type: String
+    description: SSM Parameter Store name containing the STDB org bootstrap config.
+mainSteps:
+  - name: createBootstrapRole
+    action: aws:executeScript
+    isEnd: true
+    timeoutSeconds: 7200
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        ConfigParameterName: '{{ ConfigParameterName }}'
+      Script: |-
+        import json
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def load_config(parameter_name):
+            ssm = boto3.client("ssm")
+            response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            return json.loads(response["Parameter"]["Value"])
+
+        def list_accounts(orgs):
+            accounts = []
+            paginator = orgs.get_paginator("list_accounts")
+            for page in paginator.paginate():
+                accounts.extend(page.get("Accounts", []))
+            return accounts
+
+        def assume_into_account(account_id, role_name):
+            sts = boto3.client("sts")
+            response = sts.assume_role(
+                RoleArn=f"arn:aws:iam::{account_id}:role/{role_name}",
+                RoleSessionName="SSMAutomationBootstrapRoleSetup",
+            )
+            creds = response["Credentials"]
+            return boto3.client(
+                "iam",
+                aws_access_key_id=creds["AccessKeyId"],
+                aws_secret_access_key=creds["SecretAccessKey"],
+                aws_session_token=creds["SessionToken"],
+            )
+
+        def ensure_role(iam_client, role_name, management_account_id):
+            assume_role_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {
+                            "AWS": f"arn:aws:iam::{management_account_id}:root"
+                        },
+                        "Action": "sts:AssumeRole",
+                    }
+                ],
+            }
+
+            role_existed = True
+            try:
+                iam_client.get_role(RoleName=role_name)
+            except ClientError as error:
+                if error.response["Error"]["Code"] != "NoSuchEntity":
+                    raise
+                role_existed = False
+                iam_client.create_role(
+                    RoleName=role_name,
+                    AssumeRolePolicyDocument=json.dumps(assume_role_policy),
+                    Description="Bootstrap role for STDB landing zone setup",
+                )
+
+            if role_existed:
+                iam_client.update_assume_role_policy(
+                    RoleName=role_name,
+                    PolicyDocument=json.dumps(assume_role_policy),
+                )
+
+            iam_client.attach_role_policy(
+                RoleName=role_name,
+                PolicyArn="arn:aws:iam::aws:policy/AdministratorAccess",
+            )
+
+            return role_existed
+
+        def script_handler(events, context):
+            config = load_config(events["ConfigParameterName"])
+            orgs = boto3.client("organizations")
+            accounts = {account["Email"]: account for account in list_accounts(orgs)}
+
+            bootstrap_role_name = config["bootstrap"]["roleName"]
+            org_access_role_name = config["bootstrap"]["orgAccessRoleName"]
+            management_account_id = config["bootstrap"]["managementAccountId"]
+
+            created = []
+            updated = []
+
+            for account in config.get("accounts", []):
+                current = accounts.get(account["email"])
+                if not current:
+                    raise ValueError(f"Account not found for email {account['email']}")
+
+                iam_client = assume_into_account(current["Id"], org_access_role_name)
+                existed = ensure_role(
+                    iam_client,
+                    bootstrap_role_name,
+                    management_account_id,
+                )
+
+                item = {
+                    "name": current["Name"],
+                    "accountId": current["Id"],
+                    "roleName": bootstrap_role_name,
+                }
+                if existed:
+                    updated.append(item)
+                else:
+                    created.append(item)
+
+            return {
+                "CreatedRoles": json.dumps(created),
+                "UpdatedRoles": json.dumps(updated),
+            }
+    outputs:
+      - Name: CreatedRoles
+        Selector: $.Payload.CreatedRoles
+        Type: String
+      - Name: UpdatedRoles
+        Selector: $.Payload.UpdatedRoles
+        Type: String

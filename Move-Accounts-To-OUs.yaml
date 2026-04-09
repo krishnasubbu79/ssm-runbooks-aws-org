@@ -1,0 +1,118 @@
+description: Moves STDB accounts into the configured target organizational units.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - moveAccounts.MovedAccounts
+  - moveAccounts.UnchangedAccounts
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+  ConfigParameterName:
+    type: String
+    description: SSM Parameter Store name containing the STDB org bootstrap config.
+mainSteps:
+  - name: moveAccounts
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        ConfigParameterName: '{{ ConfigParameterName }}'
+      Script: |-
+        import json
+        import boto3
+
+        def load_config(parameter_name):
+            ssm = boto3.client("ssm")
+            response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            return json.loads(response["Parameter"]["Value"])
+
+        def get_root_id(orgs):
+            roots = orgs.list_roots()["Roots"]
+            if len(roots) != 1:
+                raise ValueError(f"Expected exactly one root, found {len(roots)}")
+            return roots[0]["Id"]
+
+        def list_ous(orgs, root_id):
+            ous = []
+            paginator = orgs.get_paginator("list_organizational_units_for_parent")
+            for page in paginator.paginate(ParentId=root_id):
+                ous.extend(page.get("OrganizationalUnits", []))
+            return ous
+
+        def list_accounts(orgs):
+            accounts = []
+            paginator = orgs.get_paginator("list_accounts")
+            for page in paginator.paginate():
+                accounts.extend(page.get("Accounts", []))
+            return accounts
+
+        def get_current_parent(orgs, account_id):
+            parents = orgs.list_parents(ChildId=account_id)["Parents"]
+            if len(parents) != 1:
+                raise ValueError(f"Expected exactly one parent for account {account_id}, found {len(parents)}")
+            return parents[0]["Id"]
+
+        def script_handler(events, context):
+            config = load_config(events["ConfigParameterName"])
+            orgs = boto3.client("organizations")
+            root_id = get_root_id(orgs)
+            ou_by_key = {
+                item["key"]: item
+                for item in config.get("organizationalUnits", [])
+            }
+            existing_ous = {ou["Name"]: ou["Id"] for ou in list_ous(orgs, root_id)}
+            accounts = {account["Email"]: account for account in list_accounts(orgs)}
+
+            moved = []
+            unchanged = []
+
+            for account in config.get("accounts", []):
+                current = accounts.get(account["email"])
+                if not current:
+                    raise ValueError(f"Account not found for email {account['email']}")
+
+                target_ou_key = account["targetOuKey"]
+                target_ou = ou_by_key.get(target_ou_key)
+                if not target_ou:
+                    raise ValueError(f"OU key '{target_ou_key}' not found in config")
+
+                target_parent_id = existing_ous.get(target_ou["name"])
+                if not target_parent_id:
+                    raise ValueError(f"OU '{target_ou['name']}' not found in organization")
+
+                source_parent_id = get_current_parent(orgs, current["Id"])
+
+                if source_parent_id == target_parent_id:
+                    unchanged.append({
+                        "name": current["Name"],
+                        "accountId": current["Id"],
+                        "targetOuKey": target_ou_key,
+                    })
+                    continue
+
+                orgs.move_account(
+                    AccountId=current["Id"],
+                    SourceParentId=source_parent_id,
+                    DestinationParentId=target_parent_id,
+                )
+                moved.append({
+                    "name": current["Name"],
+                    "accountId": current["Id"],
+                    "fromParentId": source_parent_id,
+                    "toParentId": target_parent_id,
+                })
+
+            return {
+                "MovedAccounts": json.dumps(moved),
+                "UnchangedAccounts": json.dumps(unchanged),
+            }
+    outputs:
+      - Name: MovedAccounts
+        Selector: $.Payload.MovedAccounts
+        Type: String
+      - Name: UnchangedAccounts
+        Selector: $.Payload.UnchangedAccounts
+        Type: String

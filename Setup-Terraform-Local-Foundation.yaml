@@ -1,0 +1,449 @@
+description: Provisions Terraform prerequisites in the management account for local laptop execution — KMS key, S3 state bucket, and STDBBootstrapRole in the management account.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - discoverContext.AccountId
+  - discoverContext.Region
+  - ensureStateKey.StateKmsKeyArn
+  - ensureStateKey.UpdatedKeyPolicy
+  - ensureStateKey.KeyWasCreated
+  - ensureStateBucket.StateBucketName
+  - ensureStateBucket.UpdatedBucketPolicy
+  - ensureStateBucket.BucketWasCreated
+  - ensureBootstrapRoleInManagementAccount.BootstrapRoleArn
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume in the management account.
+  StateBucketName:
+    type: String
+    description: Name of the S3 bucket to create or validate for Terraform remote state.
+  ExistingStateKmsKeyArn:
+    type: String
+    description: Optional existing KMS key ARN to use for state-bucket encryption. Leave blank to create or reuse a key by alias.
+    default: ''
+  StateKmsAlias:
+    type: String
+    description: KMS alias to create or reuse when ExistingStateKmsKeyArn is not provided.
+    default: alias/stdb-terraform-state
+  BootstrapRoleName:
+    type: String
+    description: Name of the bootstrap role to create in the management account and to allow in the state bucket policy.
+    default: STDBBootstrapRole
+mainSteps:
+  - name: discoverContext
+    action: aws:executeScript
+    nextStep: ensureBootstrapRoleInManagementAccount
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      Script: |-
+        import boto3
+
+        def script_handler(events, context):
+            sts = boto3.client("sts")
+            session = boto3.session.Session()
+            return {
+                "AccountId": sts.get_caller_identity()["Account"],
+                "Region": session.region_name,
+            }
+    outputs:
+      - Name: AccountId
+        Selector: $.Payload.AccountId
+        Type: String
+      - Name: Region
+        Selector: $.Payload.Region
+        Type: String
+
+  - name: ensureStateKey
+    action: aws:executeScript
+    nextStep: ensureStateBucket
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        ExistingStateKmsKeyArn: '{{ ExistingStateKmsKeyArn }}'
+        StateKmsAlias: '{{ StateKmsAlias }}'
+        AccountId: '{{ discoverContext.AccountId }}'
+        BootstrapRoleName: '{{ BootstrapRoleName }}'
+      Script: |-
+        import json
+        import boto3
+
+        def build_bootstrap_role_statement(account_id, bootstrap_role_name):
+            return {
+                "Sid": "AllowManagementBootstrapRoleUsage",
+                "Effect": "Allow",
+                "Principal": {
+                    "AWS": f"arn:aws:iam::{account_id}:role/{bootstrap_role_name}"
+                },
+                "Action": [
+                    "kms:Decrypt",
+                    "kms:Encrypt",
+                    "kms:GenerateDataKey",
+                    "kms:GenerateDataKey*",
+                    "kms:DescribeKey",
+                ],
+                "Resource": "*",
+            }
+
+        def ensure_statement(policy_document, required_statement):
+            statements = policy_document.setdefault("Statement", [])
+            updated = False
+            replaced = False
+
+            for index, statement in enumerate(statements):
+                if statement.get("Sid") == required_statement["Sid"]:
+                    if statement != required_statement:
+                        statements[index] = required_statement
+                        updated = True
+                    replaced = True
+                    break
+
+            if not replaced:
+                statements.append(required_statement)
+                updated = True
+
+            return updated
+
+        def script_handler(events, context):
+            kms_client = boto3.client("kms")
+            existing_key_arn = events.get("ExistingStateKmsKeyArn", "").strip()
+            alias_name = events["StateKmsAlias"]
+            account_id = events["AccountId"]
+            bootstrap_role_name = events["BootstrapRoleName"]
+            key_was_created = False
+
+            if existing_key_arn:
+                metadata = kms_client.describe_key(KeyId=existing_key_arn)["KeyMetadata"]
+            else:
+                metadata = None
+                paginator = kms_client.get_paginator("list_aliases")
+                for page in paginator.paginate():
+                    for alias in page["Aliases"]:
+                        if alias.get("AliasName") == alias_name and alias.get("TargetKeyId"):
+                            metadata = kms_client.describe_key(KeyId=alias["TargetKeyId"])["KeyMetadata"]
+                            break
+                    if metadata:
+                        break
+
+                if metadata is None:
+                    key_policy = {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Sid": "AllowKeyAdministration",
+                                "Effect": "Allow",
+                                "Principal": {
+                                    "AWS": f"arn:aws:iam::{account_id}:root"
+                                },
+                                "Action": [
+                                    "kms:Create*",
+                                    "kms:Describe*",
+                                    "kms:Enable*",
+                                    "kms:List*",
+                                    "kms:Put*",
+                                    "kms:Update*",
+                                    "kms:Revoke*",
+                                    "kms:Disable*",
+                                    "kms:Get*",
+                                    "kms:Delete*",
+                                    "kms:TagResource",
+                                    "kms:UntagResource",
+                                    "kms:ScheduleKeyDeletion",
+                                    "kms:CancelKeyDeletion",
+                                ],
+                                "Resource": "*",
+                            },
+                            build_bootstrap_role_statement(account_id, bootstrap_role_name),
+                        ],
+                    }
+
+                    response = kms_client.create_key(
+                        Description="KMS key for STDB Terraform state bucket encryption",
+                        KeyUsage="ENCRYPT_DECRYPT",
+                        Origin="AWS_KMS",
+                        Policy=json.dumps(key_policy),
+                    )
+                    metadata = response["KeyMetadata"]
+                    kms_client.create_alias(AliasName=alias_name, TargetKeyId=metadata["KeyId"])
+                    key_was_created = True
+
+            current_policy = json.loads(
+                kms_client.get_key_policy(KeyId=metadata["KeyId"], PolicyName="default")["Policy"]
+            )
+            updated_key_policy = ensure_statement(
+                current_policy,
+                build_bootstrap_role_statement(account_id, bootstrap_role_name),
+            )
+            if updated_key_policy:
+                kms_client.put_key_policy(
+                    KeyId=metadata["KeyId"],
+                    PolicyName="default",
+                    Policy=json.dumps(current_policy),
+                )
+
+            return {
+                "StateKmsKeyArn": metadata["Arn"],
+                "StateKmsKeyId": metadata["KeyId"],
+                "UpdatedKeyPolicy": str(updated_key_policy).lower(),
+                "KeyWasCreated": str(key_was_created).lower(),
+            }
+    outputs:
+      - Name: StateKmsKeyArn
+        Selector: $.Payload.StateKmsKeyArn
+        Type: String
+      - Name: StateKmsKeyId
+        Selector: $.Payload.StateKmsKeyId
+        Type: String
+      - Name: UpdatedKeyPolicy
+        Selector: $.Payload.UpdatedKeyPolicy
+        Type: String
+      - Name: KeyWasCreated
+        Selector: $.Payload.KeyWasCreated
+        Type: String
+
+  - name: ensureStateBucket
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        StateBucketName: '{{ StateBucketName }}'
+        StateKmsKeyArn: '{{ ensureStateKey.StateKmsKeyArn }}'
+        Region: '{{ discoverContext.Region }}'
+        AccountId: '{{ discoverContext.AccountId }}'
+        BootstrapRoleName: '{{ BootstrapRoleName }}'
+      Script: |-
+        import json
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def ensure_bucket(s3_client, bucket_name, region):
+            """Create bucket if it doesn't exist. Idempotent — handles
+            BucketAlreadyOwnedByYou without needing HeadBucket/ListBucket
+            permissions on an already-locked-down bucket."""
+            try:
+                if region == "us-east-1":
+                    s3_client.create_bucket(Bucket=bucket_name)
+                else:
+                    s3_client.create_bucket(
+                        Bucket=bucket_name,
+                        CreateBucketConfiguration={"LocationConstraint": region},
+                    )
+            except ClientError as error:
+                if error.response["Error"]["Code"] == "BucketAlreadyOwnedByYou":
+                    return False
+                else:
+                    raise
+            return True
+
+        def build_bucket_policy(bucket_name, kms_key_arn, allowed_principals):
+            return {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "DenyInsecureTransport",
+                        "Effect": "Deny",
+                        "Principal": {"AWS": allowed_principals},
+                        "Action": "s3:*",
+                        "Resource": [
+                            f"arn:aws:s3:::{bucket_name}",
+                            f"arn:aws:s3:::{bucket_name}/*",
+                        ],
+                        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+                    },
+                    {
+                        "Sid": "DenyIncorrectEncryptionHeader",
+                        "Effect": "Deny",
+                        "Principal": {"AWS": allowed_principals},
+                        "Action": "s3:PutObject",
+                        "Resource": f"arn:aws:s3:::{bucket_name}/*",
+                        "Condition": {
+                            "StringNotEquals": {
+                                "s3:x-amz-server-side-encryption": "aws:kms",
+                            }
+                        },
+                    },
+                    {
+                        "Sid": "DenyWrongKmsKey",
+                        "Effect": "Deny",
+                        "Principal": {"AWS": allowed_principals},
+                        "Action": "s3:PutObject",
+                        "Resource": f"arn:aws:s3:::{bucket_name}/*",
+                        "Condition": {
+                            "StringNotEquals": {
+                                "s3:x-amz-server-side-encryption-aws-kms-key-id": kms_key_arn,
+                            }
+                        },
+                    },
+                    {
+                        "Sid": "AllowAuthorizedAccess",
+                        "Effect": "Allow",
+                        "Principal": {"AWS": allowed_principals},
+                        "Action": [
+                            "s3:GetObject",
+                            "s3:PutObject",
+                            "s3:DeleteObject",
+                            "s3:ListBucket",
+                        ],
+                        "Resource": [
+                            f"arn:aws:s3:::{bucket_name}",
+                            f"arn:aws:s3:::{bucket_name}/*",
+                        ],
+                    },
+                ],
+            }
+
+        def normalized_json(document):
+            return json.dumps(document, sort_keys=True)
+
+        def script_handler(events, context):
+            s3_client = boto3.client("s3")
+            bucket_name = events["StateBucketName"]
+            kms_key_arn = events["StateKmsKeyArn"]
+            region = events["Region"]
+            account_id = events["AccountId"]
+            bootstrap_role_name = events["BootstrapRoleName"]
+
+            bucket_was_created = ensure_bucket(s3_client, bucket_name, region)
+
+            s3_client.put_public_access_block(
+                Bucket=bucket_name,
+                PublicAccessBlockConfiguration={
+                    "BlockPublicAcls": True,
+                    "IgnorePublicAcls": True,
+                    "BlockPublicPolicy": True,
+                    "RestrictPublicBuckets": True,
+                },
+            )
+            s3_client.put_bucket_versioning(
+                Bucket=bucket_name,
+                VersioningConfiguration={"Status": "Enabled"},
+            )
+            s3_client.put_bucket_encryption(
+                Bucket=bucket_name,
+                ServerSideEncryptionConfiguration={
+                    "Rules": [
+                        {
+                            "ApplyServerSideEncryptionByDefault": {
+                                "SSEAlgorithm": "aws:kms",
+                                "KMSMasterKeyID": kms_key_arn,
+                            },
+                            "BucketKeyEnabled": True,
+                        }
+                    ]
+                },
+            )
+
+            allowed_principals = [
+                f"arn:aws:iam::{account_id}:role/{bootstrap_role_name}",
+                f"arn:aws:iam::{account_id}:root",
+            ]
+
+            intended_bucket_policy = build_bucket_policy(bucket_name, kms_key_arn, allowed_principals)
+            try:
+                current_bucket_policy = json.loads(
+                    s3_client.get_bucket_policy(Bucket=bucket_name)["Policy"]
+                )
+            except ClientError as error:
+                if error.response["Error"]["Code"] != "NoSuchBucketPolicy":
+                    raise
+                current_bucket_policy = None
+
+            updated_bucket_policy = current_bucket_policy is None or (
+                normalized_json(current_bucket_policy) != normalized_json(intended_bucket_policy)
+            )
+            if updated_bucket_policy:
+                s3_client.put_bucket_policy(
+                    Bucket=bucket_name,
+                    Policy=json.dumps(intended_bucket_policy),
+                )
+
+            return {
+                "StateBucketName": bucket_name,
+                "UpdatedBucketPolicy": str(updated_bucket_policy).lower(),
+                "BucketWasCreated": str(bucket_was_created).lower(),
+            }
+    outputs:
+      - Name: StateBucketName
+        Selector: $.Payload.StateBucketName
+        Type: String
+      - Name: UpdatedBucketPolicy
+        Selector: $.Payload.UpdatedBucketPolicy
+        Type: String
+      - Name: BucketWasCreated
+        Selector: $.Payload.BucketWasCreated
+        Type: String
+
+  - name: ensureBootstrapRoleInManagementAccount
+    action: aws:executeScript
+    nextStep: ensureStateKey
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        AccountId: '{{ discoverContext.AccountId }}'
+        BootstrapRoleName: '{{ BootstrapRoleName }}'
+      Script: |-
+        import json
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def script_handler(events, context):
+            iam_client = boto3.client("iam")
+            role_name = events["BootstrapRoleName"]
+            account_id = events["AccountId"]
+
+            assume_role_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {
+                            "AWS": f"arn:aws:iam::{account_id}:root"
+                        },
+                        "Action": "sts:AssumeRole",
+                    }
+                ],
+            }
+
+            role_existed = True
+            try:
+                role = iam_client.get_role(RoleName=role_name)["Role"]
+            except ClientError as error:
+                if error.response["Error"]["Code"] != "NoSuchEntity":
+                    raise
+                role_existed = False
+                role = iam_client.create_role(
+                    RoleName=role_name,
+                    AssumeRolePolicyDocument=json.dumps(assume_role_policy),
+                    Description="Bootstrap role for STDB landing zone setup in management account",
+                )["Role"]
+
+            if role_existed:
+                iam_client.update_assume_role_policy(
+                    RoleName=role_name,
+                    PolicyDocument=json.dumps(assume_role_policy),
+                )
+
+            admin_policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+            attached = iam_client.list_attached_role_policies(RoleName=role_name)["AttachedPolicies"]
+            if not any(p["PolicyArn"] == admin_policy_arn for p in attached):
+                iam_client.attach_role_policy(
+                    RoleName=role_name,
+                    PolicyArn=admin_policy_arn,
+                )
+
+            return {
+                "BootstrapRoleArn": role["Arn"],
+                "CreatedRole": str(not role_existed).lower(),
+            }
+    outputs:
+      - Name: BootstrapRoleArn
+        Selector: $.Payload.BootstrapRoleArn
+        Type: String
+      - Name: CreatedRole
+        Selector: $.Payload.CreatedRole
+        Type: String

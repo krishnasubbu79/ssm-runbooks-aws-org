@@ -1,0 +1,133 @@
+description: Enables configured opt-in AWS Regions for the STDB accounts.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - enableRegions.EnabledRegions
+  - enableRegions.SkippedRegions
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+  ConfigParameterName:
+    type: String
+    description: SSM Parameter Store name containing the STDB org bootstrap config.
+  RegionNames:
+    type: StringList
+    description: List of opt-in Regions to enable for the configured accounts.
+  AccountEmails:
+    type: StringList
+    description: Optional subset of configured account emails to target. Leave empty to target all configured accounts.
+    default: []
+mainSteps:
+  - name: enableRegions
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        ConfigParameterName: '{{ ConfigParameterName }}'
+        RegionNames: '{{ RegionNames }}'
+        AccountEmails: '{{ AccountEmails }}'
+      Script: |-
+        import json
+        import boto3
+
+        def load_config(parameter_name):
+            ssm = boto3.client("ssm")
+            response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            return json.loads(response["Parameter"]["Value"])
+
+        def list_accounts(orgs):
+            accounts = []
+            paginator = orgs.get_paginator("list_accounts")
+            for page in paginator.paginate():
+                accounts.extend(page.get("Accounts", []))
+            return accounts
+
+        def list_regions(account_client, account_id):
+            paginator = account_client.get_paginator("list_regions")
+            regions = []
+            for page in paginator.paginate(AccountId=account_id):
+                regions.extend(page.get("Regions", []))
+            return regions
+
+        def script_handler(events, context):
+            config = load_config(events["ConfigParameterName"])
+            region_names = list(events.get("RegionNames", []))
+            target_emails = set(events.get("AccountEmails", []))
+
+            if not region_names:
+                raise ValueError("RegionNames must contain at least one opt-in region")
+
+            orgs = boto3.client("organizations")
+            account_client = boto3.client("account")
+
+            configured_accounts = config.get("accounts", [])
+            if target_emails:
+                configured_accounts = [
+                    account for account in configured_accounts
+                    if account["email"] in target_emails
+                ]
+
+            if not configured_accounts:
+                raise ValueError("No configured accounts matched the requested AccountEmails")
+
+            existing_accounts = {account["Email"]: account for account in list_accounts(orgs)}
+
+            requested = []
+            skipped = []
+
+            for configured_account in configured_accounts:
+                current = existing_accounts.get(configured_account["email"])
+                if not current:
+                    raise ValueError(f"Account not found for email {configured_account['email']}")
+
+                account_id = current["Id"]
+                current_regions = {
+                    region["RegionName"]: region["RegionOptStatus"]
+                    for region in list_regions(account_client, account_id)
+                }
+
+                for region_name in region_names:
+                    current_status = current_regions.get(region_name)
+                    if current_status in ("ENABLED", "ENABLED_BY_DEFAULT"):
+                        skipped.append({
+                            "accountId": account_id,
+                            "accountEmail": configured_account["email"],
+                            "regionName": region_name,
+                            "status": current_status,
+                        })
+                        continue
+
+                    if current_status == "ENABLING":
+                        requested.append({
+                            "accountId": account_id,
+                            "accountEmail": configured_account["email"],
+                            "regionName": region_name,
+                            "status": "ALREADY_ENABLING",
+                        })
+                        continue
+
+                    account_client.enable_region(
+                        AccountId=account_id,
+                        RegionName=region_name,
+                    )
+                    requested.append({
+                        "accountId": account_id,
+                        "accountEmail": configured_account["email"],
+                        "regionName": region_name,
+                        "status": "ENABLE_REQUESTED",
+                    })
+
+            return {
+                "EnabledRegions": json.dumps(requested),
+                "SkippedRegions": json.dumps(skipped),
+            }
+    outputs:
+      - Name: EnabledRegions
+        Selector: $.Payload.EnabledRegions
+        Type: String
+      - Name: SkippedRegions
+        Selector: $.Payload.SkippedRegions
+        Type: String

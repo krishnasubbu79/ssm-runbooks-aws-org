@@ -1,0 +1,180 @@
+description: Waits for in-flight STDB account creation requests and returns the resulting account ids.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - waitForAccounts.ResolvedAccounts
+  - waitForAccounts.FailedAccounts
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+  ConfigParameterName:
+    type: String
+    description: SSM Parameter Store name containing the STDB org bootstrap config.
+mainSteps:
+  - name: waitForAccounts
+    action: aws:executeScript
+    isEnd: true
+    timeoutSeconds: 14400
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        ConfigParameterName: '{{ ConfigParameterName }}'
+      Script: |-
+        import json
+        import time
+        import boto3
+
+        def load_config(parameter_name):
+            ssm = boto3.client("ssm")
+            response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            return json.loads(response["Parameter"]["Value"])
+
+        def list_accounts(orgs):
+            accounts = []
+            paginator = orgs.get_paginator("list_accounts")
+            for page in paginator.paginate():
+                accounts.extend(page.get("Accounts", []))
+            return accounts
+
+        def list_in_progress_requests(orgs):
+            statuses = []
+            paginator = orgs.get_paginator("list_create_account_status")
+            for page in paginator.paginate(States=["IN_PROGRESS"]):
+                statuses.extend(page.get("CreateAccountStatuses", []))
+            return statuses
+
+        def script_handler(events, context):
+            config = load_config(events["ConfigParameterName"])
+            orgs = boto3.client("organizations")
+
+            # Resolve accounts that already exist
+            existing_accounts = list_accounts(orgs)
+            by_email = {account["Email"]: account for account in existing_accounts}
+
+            resolved = []
+            missing_emails = set()
+
+            for account in config.get("accounts", []):
+                current = by_email.get(account["email"])
+                if current:
+                    resolved.append({
+                        "name": current["Name"],
+                        "email": current["Email"],
+                        "accountId": current["Id"],
+                        "status": "EXISTING",
+                    })
+                else:
+                    missing_emails.add(account["email"])
+
+            if not missing_emails:
+                return {
+                    "ResolvedAccounts": json.dumps(resolved),
+                    "FailedAccounts": json.dumps([]),
+                }
+
+            # Find in-progress creation requests that match missing emails
+            in_progress = list_in_progress_requests(orgs)
+            pending_ids = {
+                status["Id"]: status["AccountName"]
+                for status in in_progress
+                if status.get("AccountName") and status["AccountName"] in {
+                    account["name"]
+                    for account in config.get("accounts", [])
+                    if account["email"] in missing_emails
+                }
+            }
+
+            # Also collect any request IDs we find by scanning recent statuses
+            # for emails we care about
+            if not pending_ids and missing_emails:
+                # Fall back to polling list_accounts if no in-progress requests found
+                # This handles the case where creation completed between steps
+                pass
+
+            failed = []
+            deadline = time.time() + 14000  # slightly less than step timeout
+
+            while missing_emails:
+                # Poll in-progress requests by their status ID
+                still_pending = {}
+                for request_id, account_name in pending_ids.items():
+                    response = orgs.describe_create_account_status(
+                        CreateAccountRequestId=request_id
+                    )
+                    status = response["CreateAccountStatus"]
+                    state = status["State"]
+
+                    if state == "SUCCEEDED":
+                        resolved.append({
+                            "name": status["AccountName"],
+                            "email": status.get("AccountName", ""),
+                            "accountId": status["AccountId"],
+                            "status": "CREATED",
+                        })
+                        # Remove from missing by matching account name to email
+                        for acc in config.get("accounts", []):
+                            if acc["name"] == status["AccountName"]:
+                                missing_emails.discard(acc["email"])
+                                resolved[-1]["email"] = acc["email"]
+                                break
+                    elif state == "FAILED":
+                        failed.append({
+                            "name": status["AccountName"],
+                            "requestId": request_id,
+                            "failureReason": status.get("FailureReason", "unknown"),
+                        })
+                        for acc in config.get("accounts", []):
+                            if acc["name"] == status["AccountName"]:
+                                missing_emails.discard(acc["email"])
+                                break
+                    else:
+                        still_pending[request_id] = account_name
+
+                pending_ids = still_pending
+
+                # Also check list_accounts for any that appeared without tracked IDs
+                if missing_emails and not pending_ids:
+                    accounts = list_accounts(orgs)
+                    by_email = {a["Email"]: a for a in accounts}
+                    newly_found = []
+                    for email in list(missing_emails):
+                        current = by_email.get(email)
+                        if current:
+                            resolved.append({
+                                "name": current["Name"],
+                                "email": current["Email"],
+                                "accountId": current["Id"],
+                                "status": "CREATED",
+                            })
+                            newly_found.append(email)
+                    for email in newly_found:
+                        missing_emails.discard(email)
+
+                if not missing_emails:
+                    break
+
+                if time.time() > deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for accounts: {sorted(missing_emails)}"
+                    )
+
+                time.sleep(30)
+
+            if failed:
+                raise RuntimeError(
+                    f"Account creation failed for: {json.dumps(failed)}"
+                )
+
+            return {
+                "ResolvedAccounts": json.dumps(resolved),
+                "FailedAccounts": json.dumps(failed),
+            }
+    outputs:
+      - Name: ResolvedAccounts
+        Selector: $.Payload.ResolvedAccounts
+        Type: String
+      - Name: FailedAccounts
+        Selector: $.Payload.FailedAccounts
+        Type: String

@@ -1,0 +1,94 @@
+description: Ensures the configured STDB organizational units exist under the organization root.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - ensureOUs.RootId
+  - ensureOUs.OuMap
+  - ensureOUs.CreatedOus
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+  ConfigParameterName:
+    type: String
+    description: SSM Parameter Store name containing the STDB org bootstrap config.
+mainSteps:
+  - name: ensureOUs
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        ConfigParameterName: '{{ ConfigParameterName }}'
+      Script: |-
+        import json
+        import boto3
+
+        def load_config(parameter_name):
+            ssm = boto3.client("ssm")
+            response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            return json.loads(response["Parameter"]["Value"])
+
+        def get_root_id(orgs):
+            roots = orgs.list_roots()["Roots"]
+            if len(roots) != 1:
+                raise ValueError(f"Expected exactly one root, found {len(roots)}")
+            return roots[0]["Id"]
+
+        def list_ous_for_parent(orgs, parent_id):
+            ous = []
+            paginator = orgs.get_paginator("list_organizational_units_for_parent")
+            for page in paginator.paginate(ParentId=parent_id):
+                ous.extend(page.get("OrganizationalUnits", []))
+            return ous
+
+        def script_handler(events, context):
+            config = load_config(events["ConfigParameterName"])
+            orgs = boto3.client("organizations")
+            root_id = get_root_id(orgs)
+            existing = {
+                ou["Name"]: ou["Id"]
+                for ou in list_ous_for_parent(orgs, root_id)
+            }
+
+            created = []
+            ou_map = {}
+
+            for ou in config.get("organizationalUnits", []):
+                if ou.get("parentKey") != "root":
+                    raise ValueError(f"Unsupported parentKey for v1: {ou.get('parentKey')}")
+
+                name = ou["name"]
+                if name in existing:
+                    ou_id = existing[name]
+                else:
+                    response = orgs.create_organizational_unit(
+                        ParentId=root_id,
+                        Name=name,
+                    )
+                    ou_id = response["OrganizationalUnit"]["Id"]
+                    existing[name] = ou_id
+                    created.append({"key": ou["key"], "name": name, "id": ou_id})
+
+                ou_map[ou["key"]] = {
+                    "name": name,
+                    "id": ou_id,
+                    "parentId": root_id,
+                }
+
+            return {
+                "RootId": root_id,
+                "OuMap": json.dumps(ou_map),
+                "CreatedOus": json.dumps(created),
+            }
+    outputs:
+      - Name: RootId
+        Selector: $.Payload.RootId
+        Type: String
+      - Name: OuMap
+        Selector: $.Payload.OuMap
+        Type: String
+      - Name: CreatedOus
+        Selector: $.Payload.CreatedOus
+        Type: String
