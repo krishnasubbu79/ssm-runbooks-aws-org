@@ -4,6 +4,7 @@ assumeRole: '{{ AutomationAssumeRole }}'
 outputs:
   - createAccounts.CreatedAccounts
   - createAccounts.ExistingAccounts
+  - createAccounts.StepMetadata
 parameters:
   AutomationAssumeRole:
     type: String
@@ -11,6 +12,10 @@ parameters:
   ConfigParameterName:
     type: String
     description: SSM Parameter Store name containing the STDB org bootstrap config.
+  RunId:
+    type: String
+    description: Correlation ID for tracing this execution in CloudWatch Logs.
+    default: ''
 mainSteps:
   - name: createAccounts
     action: aws:executeScript
@@ -20,9 +25,17 @@ mainSteps:
       Handler: script_handler
       InputPayload:
         ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ RunId }}'
       Script: |-
         import json
         import boto3
+        import uuid
+        from datetime import datetime, timezone
+
+        def log(run_id, event, **kwargs):
+            entry = {"runId": run_id, "step": "Create-Accounts", "event": event}
+            entry.update(kwargs)
+            print(json.dumps(entry))
 
         def load_config(parameter_name):
             ssm = boto3.client("ssm")
@@ -37,7 +50,14 @@ mainSteps:
             return accounts
 
         def script_handler(events, context):
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                run_id = f"create-accounts-{ts}-{uuid.uuid4().hex[:6]}"
+            log(run_id, "step_started")
+
             config = load_config(events["ConfigParameterName"])
+            log(run_id, "config_loaded", accountCount=len(config.get("accounts", [])))
             orgs = boto3.client("organizations")
             existing_accounts = list_accounts(orgs)
 
@@ -47,6 +67,10 @@ mainSteps:
             existing = []
 
             role_name = config["bootstrap"]["orgAccessRoleName"]
+            account_tags = config.get("accountTags", {})
+            tag_list = [
+                {"Key": k, "Value": v} for k, v in account_tags.items()
+            ]
 
             for account in config.get("accounts", []):
                 email = account["email"]
@@ -54,6 +78,7 @@ mainSteps:
 
                 current = by_email.get(email)
                 if current:
+                    log(run_id, "account_exists", name=current["Name"], accountId=current["Id"], email=current["Email"])
                     existing.append({
                         "name": current["Name"],
                         "email": current["Email"],
@@ -62,21 +87,41 @@ mainSteps:
                     })
                     continue
 
-                response = orgs.create_account(
-                    AccountName=name,
-                    Email=email,
-                    RoleName=role_name,
-                    IamUserAccessToBilling="ALLOW",
-                )
+                create_params = {
+                    "AccountName": name,
+                    "Email": email,
+                    "RoleName": role_name,
+                    "IamUserAccessToBilling": "ALLOW",
+                }
+                if tag_list:
+                    create_params["Tags"] = tag_list
+
+                response = orgs.create_account(**create_params)
+                log(run_id, "account_create_requested", name=name, email=email, statusId=response["CreateAccountStatus"]["Id"])
                 created.append({
                     "name": name,
                     "email": email,
                     "createAccountStatusId": response["CreateAccountStatus"]["Id"],
                 })
 
+            log(run_id, "step_completed", createdCount=len(created), existingCount=len(existing))
+
             return {
                 "CreatedAccounts": json.dumps(created),
                 "ExistingAccounts": json.dumps(existing),
+                "StepMetadata": json.dumps({
+                    "runId": run_id,
+                    "step": "Create-Accounts",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "succeeded",
+                    "createdCount": len(created),
+                    "existingCount": len(existing),
+                    "recoveryGuidance": (
+                        "If some accounts failed to create, re-run Create-Accounts. "
+                        "Already-created accounts will be detected by email and skipped. "
+                        "Then run Wait-For-Account-Creation to resolve any in-flight requests."
+                    ),
+                }),
             }
     outputs:
       - Name: CreatedAccounts
@@ -84,4 +129,7 @@ mainSteps:
         Type: String
       - Name: ExistingAccounts
         Selector: $.Payload.ExistingAccounts
+        Type: String
+      - Name: StepMetadata
+        Selector: $.Payload.StepMetadata
         Type: String

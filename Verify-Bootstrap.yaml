@@ -1,0 +1,244 @@
+description: Verifies the STDB organization state matches the bootstrap config expectations.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - verifyBootstrap.VerificationResult
+  - verifyBootstrap.Mismatches
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+  ConfigParameterName:
+    type: String
+    description: SSM Parameter Store name containing the STDB org bootstrap config.
+  RunId:
+    type: String
+    description: Correlation ID for tracing this execution in CloudWatch Logs.
+    default: ''
+mainSteps:
+  - name: verifyBootstrap
+    action: aws:executeScript
+    isEnd: true
+    timeoutSeconds: 600
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ RunId }}'
+      Script: |-
+        import json
+        import uuid
+        import boto3
+        from botocore.exceptions import ClientError
+        from datetime import datetime, timezone
+
+        def log(run_id, event, **kwargs):
+            entry = {"runId": run_id, "step": "Verify-Bootstrap", "event": event}
+            entry.update(kwargs)
+            print(json.dumps(entry))
+
+        def load_config(parameter_name):
+            ssm = boto3.client("ssm")
+            response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            return json.loads(response["Parameter"]["Value"])
+
+        def get_root_id(orgs):
+            roots = orgs.list_roots()["Roots"]
+            if len(roots) != 1:
+                raise ValueError(f"Expected exactly one root, found {len(roots)}")
+            return roots[0]["Id"]
+
+        def list_ous_for_parent(orgs, parent_id):
+            ous = []
+            paginator = orgs.get_paginator("list_organizational_units_for_parent")
+            for page in paginator.paginate(ParentId=parent_id):
+                ous.extend(page.get("OrganizationalUnits", []))
+            return ous
+
+        def list_accounts(orgs):
+            accounts = []
+            paginator = orgs.get_paginator("list_accounts")
+            for page in paginator.paginate():
+                accounts.extend(page.get("Accounts", []))
+            return accounts
+
+        def get_current_parent(orgs, account_id):
+            parents = orgs.list_parents(ChildId=account_id)["Parents"]
+            if len(parents) != 1:
+                return None
+            return parents[0]["Id"]
+
+        def check_role_exists(sts, account_id, role_name):
+            try:
+                sts.assume_role(
+                    RoleArn=f"arn:aws:iam::{account_id}:role/{role_name}",
+                    RoleSessionName="BootstrapVerification",
+                    DurationSeconds=900,
+                )
+                return True
+            except ClientError:
+                return False
+
+        def script_handler(events, context):
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                run_id = f"verify-bootstrap-{ts}-{uuid.uuid4().hex[:6]}"
+            log(run_id, "step_started")
+
+            config = load_config(events["ConfigParameterName"])
+            orgs = boto3.client("organizations")
+            sts = boto3.client("sts")
+
+            root_id = get_root_id(orgs)
+            existing_ous = {
+                ou["Name"]: ou["Id"]
+                for ou in list_ous_for_parent(orgs, root_id)
+            }
+            existing_accounts = {
+                acc["Email"]: acc for acc in list_accounts(orgs)
+            }
+
+            checks = []
+            mismatches = []
+
+            # Check OUs exist
+            for ou in config.get("organizationalUnits", []):
+                name = ou["name"]
+                if name in existing_ous:
+                    log(run_id, "ou_check_pass", name=name)
+                    checks.append({
+                        "check": "ou_exists",
+                        "target": name,
+                        "status": "PASS",
+                    })
+                else:
+                    log(run_id, "ou_check_fail", name=name)
+                    checks.append({
+                        "check": "ou_exists",
+                        "target": name,
+                        "status": "FAIL",
+                    })
+                    mismatches.append({
+                        "type": "missing_ou",
+                        "expected": name,
+                    })
+
+            # Check accounts exist and are in correct OUs
+            ou_by_key = {
+                item["key"]: item
+                for item in config.get("organizationalUnits", [])
+            }
+
+            bootstrap_role_name = config["bootstrap"]["roleName"]
+
+            for acc in config.get("accounts", []):
+                email = acc["email"]
+                name = acc["name"]
+                target_ou_key = acc["targetOuKey"]
+
+                current = existing_accounts.get(email)
+                if not current:
+                    log(run_id, "account_check_fail", name=name, email=email)
+                    checks.append({
+                        "check": "account_exists",
+                        "target": name,
+                        "status": "FAIL",
+                    })
+                    mismatches.append({
+                        "type": "missing_account",
+                        "expected": name,
+                        "email": email,
+                    })
+                    continue
+
+                log(run_id, "account_check_pass", name=name, accountId=current["Id"])
+                checks.append({
+                    "check": "account_exists",
+                    "target": name,
+                    "status": "PASS",
+                    "accountId": current["Id"],
+                })
+
+                # Check account placement
+                target_ou = ou_by_key.get(target_ou_key, {})
+                target_ou_name = target_ou.get("name", "")
+                expected_parent_id = existing_ous.get(target_ou_name)
+                actual_parent_id = get_current_parent(orgs, current["Id"])
+
+                if expected_parent_id and actual_parent_id == expected_parent_id:
+                    log(run_id, "placement_check_pass", name=name, ouKey=target_ou_key)
+                    checks.append({
+                        "check": "account_placement",
+                        "target": name,
+                        "status": "PASS",
+                        "ouKey": target_ou_key,
+                    })
+                else:
+                    log(run_id, "placement_check_fail", name=name, expectedOu=target_ou_key)
+                    checks.append({
+                        "check": "account_placement",
+                        "target": name,
+                        "status": "FAIL",
+                        "expectedParent": expected_parent_id or "unknown",
+                        "actualParent": actual_parent_id or "unknown",
+                    })
+                    mismatches.append({
+                        "type": "wrong_ou",
+                        "account": name,
+                        "expectedOu": target_ou_key,
+                        "expectedParentId": expected_parent_id,
+                        "actualParentId": actual_parent_id,
+                    })
+
+                # Check bootstrap role assumable
+                role_ok = check_role_exists(sts, current["Id"], bootstrap_role_name)
+                if role_ok:
+                    log(run_id, "role_check_pass", name=name, accountId=current["Id"])
+                    checks.append({
+                        "check": "bootstrap_role",
+                        "target": name,
+                        "status": "PASS",
+                        "roleName": bootstrap_role_name,
+                    })
+                else:
+                    log(run_id, "role_check_fail", name=name, accountId=current["Id"])
+                    checks.append({
+                        "check": "bootstrap_role",
+                        "target": name,
+                        "status": "FAIL",
+                        "roleName": bootstrap_role_name,
+                    })
+                    mismatches.append({
+                        "type": "missing_or_unassumable_role",
+                        "account": name,
+                        "accountId": current["Id"],
+                        "roleName": bootstrap_role_name,
+                    })
+
+            passed = sum(1 for c in checks if c["status"] == "PASS")
+            failed = sum(1 for c in checks if c["status"] == "FAIL")
+            overall = "PASS" if failed == 0 else "FAIL"
+
+            log(run_id, "step_completed", status=overall, passed=passed, failed=failed, totalChecks=len(checks))
+
+            return {
+                "VerificationResult": json.dumps({
+                    "runId": run_id,
+                    "status": overall,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "totalChecks": len(checks),
+                    "passed": passed,
+                    "failed": failed,
+                    "checks": checks,
+                }),
+                "Mismatches": json.dumps(mismatches),
+            }
+    outputs:
+      - Name: VerificationResult
+        Selector: $.Payload.VerificationResult
+        Type: String
+      - Name: Mismatches
+        Selector: $.Payload.Mismatches
+        Type: String

@@ -1,0 +1,276 @@
+description: >-
+  Enables centralized root access management for the STDB organization and
+  removes root credentials from all configured child accounts. After this
+  runbook runs, root user access is managed centrally from the management
+  account — child accounts cannot independently set root passwords or
+  access keys. Idempotent and safe to re-run.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - secureRootAccess.OrganizationFeatures
+  - secureRootAccess.AccountResults
+  - secureRootAccess.StepMetadata
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+  ConfigParameterName:
+    type: String
+    description: SSM Parameter Store name containing the STDB org bootstrap config.
+  RunId:
+    type: String
+    description: Correlation ID for tracing this execution in CloudWatch Logs.
+    default: ''
+mainSteps:
+  - name: secureRootAccess
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ RunId }}'
+      Script: |-
+        import json
+        import boto3
+        import uuid
+        import time
+        from botocore.exceptions import ClientError
+        from datetime import datetime, timezone
+
+        def log(run_id, event, **kwargs):
+            entry = {"runId": run_id, "step": "Secure-Root-Access", "event": event}
+            entry.update(kwargs)
+            print(json.dumps(entry))
+
+        def load_config(parameter_name):
+            ssm = boto3.client("ssm")
+            raw = ssm.get_parameter(Name=parameter_name, WithDecryption=True)["Parameter"]["Value"]
+            return json.loads(raw)
+
+        def get_account_ids(config):
+            """Resolve configured account emails to account IDs from AWS Organizations."""
+            orgs = boto3.client("organizations")
+            all_accounts = {}
+            paginator = orgs.get_paginator("list_accounts")
+            for page in paginator.paginate():
+                for acct in page["Accounts"]:
+                    if acct["Status"] == "ACTIVE":
+                        all_accounts[acct["Email"]] = acct
+
+            configured = []
+            for acct_cfg in config.get("accounts", []):
+                email = acct_cfg["email"]
+                acct = all_accounts.get(email)
+                if acct:
+                    configured.append({
+                        "name": acct.get("Name", acct_cfg["name"]),
+                        "email": email,
+                        "id": acct["Id"],
+                    })
+            return configured
+
+        def enable_org_features(run_id):
+            """Enable trusted access for IAM and centralized root features. Idempotent."""
+            orgs = boto3.client("organizations")
+            iam = boto3.client("iam")
+
+            # Step 1: Enable trusted access for IAM in Organizations
+            try:
+                orgs.enable_aws_service_access(ServicePrincipal="iam.amazonaws.com")
+                log(run_id, "trusted_access_enabled", service="iam.amazonaws.com")
+            except ClientError as e:
+                if "already enabled" in str(e).lower():
+                    log(run_id, "trusted_access_already_enabled", service="iam.amazonaws.com")
+                else:
+                    raise
+
+            # Step 2: Enable centralized root credentials management
+            try:
+                resp = iam.enable_organizations_root_credentials_management()
+                features = resp.get("EnabledFeatures", [])
+                log(run_id, "root_credentials_management_enabled", features=features)
+            except ClientError as e:
+                if "already enabled" in str(e).lower():
+                    log(run_id, "root_credentials_management_already_enabled")
+                else:
+                    raise
+
+            # Step 3: Enable centralized root sessions
+            try:
+                resp = iam.enable_organizations_root_sessions()
+                features = resp.get("EnabledFeatures", [])
+                log(run_id, "root_sessions_enabled", features=features)
+            except ClientError as e:
+                if "already enabled" in str(e).lower():
+                    log(run_id, "root_sessions_already_enabled")
+                else:
+                    raise
+
+            # Step 4: Verify features are enabled
+            verify_resp = iam.list_organizations_features()
+            enabled = verify_resp.get("EnabledFeatures", [])
+            log(run_id, "org_features_verified", enabledFeatures=enabled)
+            return enabled
+
+        def remove_root_credentials_for_account(run_id, account_id, account_name):
+            """Assume a scoped root session and remove any existing root credentials."""
+            sts = boto3.client("sts")
+            results = {
+                "accountId": account_id,
+                "accountName": account_name,
+                "loginProfileDeleted": False,
+                "accessKeysDeleted": 0,
+                "signingCertsDeleted": 0,
+                "mfaDevicesDeactivated": 0,
+                "errors": [],
+            }
+
+            # Assume root with IAMDeleteRootUserCredentials task policy
+            try:
+                root_creds = sts.assume_root(
+                    TargetPrincipal=account_id,
+                    TaskPolicyArn={
+                        "arn": "arn:aws:iam::aws:policy/root-task/IAMDeleteRootUserCredentials"
+                    },
+                    DurationSeconds=900,
+                )["Credentials"]
+            except Exception as e:
+                error_msg = str(e)
+                log(run_id, "assume_root_failed", accountId=account_id, accountName=account_name, error=error_msg)
+                results["errors"].append(f"AssumeRoot failed: {error_msg}")
+                return results
+
+            # Create IAM client with the scoped root session credentials
+            iam_root = boto3.client(
+                "iam",
+                aws_access_key_id=root_creds["AccessKeyId"],
+                aws_secret_access_key=root_creds["SecretAccessKey"],
+                aws_session_token=root_creds["SessionToken"],
+            )
+
+            # Delete login profile (root password)
+            try:
+                iam_root.delete_login_profile(UserName="root")
+                results["loginProfileDeleted"] = True
+                log(run_id, "root_login_profile_deleted", accountId=account_id, accountName=account_name)
+            except iam_root.exceptions.NoSuchEntityException:
+                log(run_id, "root_login_profile_not_found", accountId=account_id, accountName=account_name)
+            except Exception as e:
+                results["errors"].append(f"DeleteLoginProfile: {e}")
+
+            # Delete access keys
+            try:
+                keys = iam_root.list_access_keys(UserName="root")["AccessKeyMetadata"]
+                for key in keys:
+                    iam_root.delete_access_key(UserName="root", AccessKeyId=key["AccessKeyId"])
+                    results["accessKeysDeleted"] += 1
+                if keys:
+                    log(run_id, "root_access_keys_deleted", accountId=account_id, accountName=account_name, count=len(keys))
+                else:
+                    log(run_id, "root_access_keys_not_found", accountId=account_id, accountName=account_name)
+            except Exception as e:
+                results["errors"].append(f"DeleteAccessKeys: {e}")
+
+            # Delete signing certificates
+            try:
+                certs = iam_root.list_signing_certificates(UserName="root")["Certificates"]
+                for cert in certs:
+                    iam_root.delete_signing_certificate(UserName="root", CertificateId=cert["CertificateId"])
+                    results["signingCertsDeleted"] += 1
+                if certs:
+                    log(run_id, "root_signing_certs_deleted", accountId=account_id, accountName=account_name, count=len(certs))
+                else:
+                    log(run_id, "root_signing_certs_not_found", accountId=account_id, accountName=account_name)
+            except Exception as e:
+                results["errors"].append(f"DeleteSigningCerts: {e}")
+
+            # Deactivate and delete MFA devices
+            try:
+                mfa_devices = iam_root.list_mfa_devices(UserName="root")["MFADevices"]
+                for device in mfa_devices:
+                    iam_root.deactivate_mfa_device(UserName="root", SerialNumber=device["SerialNumber"])
+                    try:
+                        iam_root.delete_virtual_mfa_device(SerialNumber=device["SerialNumber"])
+                    except Exception:
+                        pass  # Hardware MFA can't be deleted, only deactivated
+                    results["mfaDevicesDeactivated"] += 1
+                if mfa_devices:
+                    log(run_id, "root_mfa_deactivated", accountId=account_id, accountName=account_name, count=len(mfa_devices))
+                else:
+                    log(run_id, "root_mfa_not_found", accountId=account_id, accountName=account_name)
+            except Exception as e:
+                results["errors"].append(f"DeactivateMFA: {e}")
+
+            status = "clean" if not results["errors"] else "partial"
+            log(run_id, "account_root_secured", accountId=account_id, accountName=account_name, status=status,
+                loginProfileDeleted=results["loginProfileDeleted"],
+                accessKeysDeleted=results["accessKeysDeleted"],
+                signingCertsDeleted=results["signingCertsDeleted"],
+                mfaDevicesDeactivated=results["mfaDevicesDeactivated"])
+
+            return results
+
+        def script_handler(events, context):
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                run_id = f"secure-root-{ts}-{uuid.uuid4().hex[:6]}"
+
+            log(run_id, "step_started")
+
+            config = load_config(events["ConfigParameterName"])
+            log(run_id, "config_loaded", accountCount=len(config.get("accounts", [])))
+
+            # Enable org-level centralized root features
+            enabled_features = enable_org_features(run_id)
+
+            # Resolve account names to IDs
+            accounts = get_account_ids(config)
+            log(run_id, "accounts_resolved", resolvedCount=len(accounts),
+                configuredCount=len(config.get("accounts", [])))
+
+            if len(accounts) != len(config.get("accounts", [])):
+                missing = set(a["email"] for a in config["accounts"]) - set(a["email"] for a in accounts)
+                log(run_id, "accounts_missing", missingEmails=list(missing))
+
+            # Remove root credentials from each child account
+            account_results = []
+            errors_total = 0
+            for acct in accounts:
+                result = remove_root_credentials_for_account(run_id, acct["id"], acct["name"])
+                account_results.append(result)
+                errors_total += len(result.get("errors", []))
+
+            overall_status = "success" if errors_total == 0 else "partial_failure"
+
+            step_metadata = {
+                "stepName": "Secure-Root-Access",
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "status": overall_status,
+                "organizationFeatures": enabled_features,
+                "accountsProcessed": len(account_results),
+                "accountsClean": sum(1 for r in account_results if not r.get("errors")),
+                "accountsWithErrors": errors_total,
+                "recoveryGuidance": "Re-run this runbook to retry failed accounts. The runbook is idempotent."
+                    if errors_total > 0 else "All child account root credentials secured.",
+            }
+
+            log(run_id, "step_completed", **step_metadata)
+
+            return {
+                "OrganizationFeatures": json.dumps(enabled_features),
+                "AccountResults": json.dumps(account_results),
+                "StepMetadata": json.dumps(step_metadata),
+            }
+    outputs:
+      - Name: OrganizationFeatures
+        Selector: $.Payload.OrganizationFeatures
+        Type: String
+      - Name: AccountResults
+        Selector: $.Payload.AccountResults
+        Type: String
+      - Name: StepMetadata
+        Selector: $.Payload.StepMetadata
+        Type: String

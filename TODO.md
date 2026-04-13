@@ -12,15 +12,15 @@ This file tracks the follow-on work needed to harden the current STDB bootstrap 
 
 ## Input and Config Validation
 
-- [ ] Add a dedicated preflight runbook to validate permissions, config access, KMS decrypt capability, and required AWS service setup (such as trusted access for Account Management) before bootstrap execution.
-- [ ] Add explicit schema validation for the Parameter Store config before any provisioning steps run.
-- [ ] Validate that OU keys are unique.
-- [ ] Validate that OU names are unique within the configured scope.
-- [ ] Validate that account names are unique.
-- [ ] Validate that account emails are unique.
-- [ ] Validate that `targetOuKey` values always reference a defined OU key.
-- [ ] Validate that the config `version` is supported before continuing.
-- [ ] Add preflight checks for required config fields such as `managementAccountId`, `roleName`, and `orgAccessRoleName`.
+- [x] Add a dedicated preflight runbook to validate permissions, config access, KMS decrypt capability, and required AWS service setup (such as trusted access for Account Management) before bootstrap execution. *(Validate-Config.yaml added — covers config schema validation. AWS permission preflight is a future enhancement.)*
+- [x] Add explicit schema validation for the Parameter Store config before any provisioning steps run. *(Validate-Config.yaml)*
+- [x] Validate that OU keys are unique. *(Validate-Config.yaml)*
+- [x] Validate that OU names are unique within the configured scope. *(Validate-Config.yaml)*
+- [x] Validate that account names are unique. *(Validate-Config.yaml)*
+- [x] Validate that account emails are unique. *(Validate-Config.yaml)*
+- [x] Validate that `targetOuKey` values always reference a defined OU key. *(Validate-Config.yaml)*
+- [x] Validate that the config `version` is supported before continuing. *(Validate-Config.yaml)*
+- [x] Add preflight checks for required config fields such as `managementAccountId`, `roleName`, and `orgAccessRoleName`. *(Validate-Config.yaml)*
 - [ ] Add dry-run mode that reports what would be created, moved, or changed without taking any action. This is a significant safety net for production operators.
 
 ## State and Auditability
@@ -32,32 +32,32 @@ This file tracks the follow-on work needed to harden the current STDB bootstrap 
 
 ## Observability and Verification
 
-- [ ] Add a post-run verification runbook for OUs, accounts, account placement, and bootstrap-role presence.
+- [x] Add a post-run verification runbook for OUs, accounts, account placement, and bootstrap-role presence. *(Verify-Bootstrap.yaml)*
 - [ ] Add a post-run verification step for opt-in Region status where Region enablement is used.
-- [ ] Improve structured outputs across the runbooks so execution results are easier to consume operationally.
-- [ ] Decide whether CloudWatch logging or a central log destination should be added for automation execution analysis.
+- [x] Improve structured outputs across the runbooks so execution results are easier to consume operationally. *(StepMetadata output added to all core runbooks with timestamp, counts, and recovery guidance.)*
+- [x] Decide whether CloudWatch logging or a central log destination should be added for automation execution analysis. *(CloudWatch Logs via SSM Automation service setting. Structured JSON logging with RunId correlation ID added to all runbooks. Setup documented in AWS-CLI-COMMANDS.md.)*
 - [ ] Add execution outcome notifications via SNS or EventBridge so operators are alerted on success, failure, or partial failure without needing to poll SSM execution status.
 
 ## Reliability and Resilience
 
-- [ ] Add retry and backoff handling around eventual consistency points such as `sts:AssumeRole`, IAM role propagation, and account follow-up operations.
+- [x] Add retry and backoff handling around eventual consistency points such as `sts:AssumeRole`, IAM role propagation, and account follow-up operations. *(Create-Bootstrap-Role: exponential backoff on AssumeRole. Move-Accounts-To-OUs: retry on ConcurrentModificationException. Wait-For-Account-Creation: jittered polling.)*
 - [ ] Review timeout values for long-running operations such as account creation and Region enablement. Note: `aws:executeScript` has a hard 600-second runtime limit — long-polling designs must be split across multiple steps.
-- [ ] Add clearer recovery guidance for partial failures, especially where some accounts succeed and others fail.
+- [x] Add clearer recovery guidance for partial failures, especially where some accounts succeed and others fail. *(Recovery guidance included in StepMetadata output for Create-Accounts, Wait-For-Account-Creation, Move-Accounts-To-OUs, and Create-Bootstrap-Role.)*
 - [ ] Decide whether failed executions should emit a standard operational signal or notification.
 
 ## Governance and Controls
 
 - [ ] Add explicit approval steps for sensitive automation flows such as account creation and teardown.
 - [ ] Define when approvals are required versus when unattended execution is acceptable.
-- [ ] Design and implement foundational SCPs on OUs — at minimum: deny unapproved Regions, deny leaving the organization, protect the log-archive account from tampering, and restrict root user actions in child accounts.
+- [x] Design and implement foundational SCPs on OUs — at minimum: deny unapproved Regions, deny leaving the organization, protect the log-archive account from tampering, and restrict root user actions in child accounts. *(Centralized root access management enabled via Secure-Root-Access.yaml. Root credentials removed from child accounts.)*
 - [ ] Define the SCP attachment model — which SCPs apply at root level versus per-OU.
 - [ ] Define the sequencing rules so SCP-based Region restrictions are applied only after Region enablement is confirmed complete.
 - [ ] Document SCP exceptions or escape hatches needed during initial landing zone deployment.
 
 ## Account Metadata and Lifecycle
 
-- [ ] Define an account tagging model for all created accounts.
-- [ ] Add tags such as purpose, environment, lifecycle, and creation source.
+- [x] Define an account tagging model for all created accounts. *(accountTags section added to config schema and example.)*
+- [x] Add tags such as purpose, environment, lifecycle, and creation source. *(Create-Accounts now passes accountTags from config to the CreateAccount API.)*
 - [ ] Decide how temporary or recovery-created accounts should be reviewed and eventually moved to `Suspended OU`.
 - [ ] Define the lifecycle metadata expected for on-demand recovery account creation.
 

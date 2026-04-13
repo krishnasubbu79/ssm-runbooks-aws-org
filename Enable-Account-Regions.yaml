@@ -4,6 +4,7 @@ assumeRole: '{{ AutomationAssumeRole }}'
 outputs:
   - enableRegions.EnabledRegions
   - enableRegions.SkippedRegions
+  - enableRegions.StepMetadata
 parameters:
   AutomationAssumeRole:
     type: String
@@ -18,6 +19,10 @@ parameters:
     type: StringList
     description: Optional subset of configured account emails to target. Leave empty to target all configured accounts.
     default: []
+  RunId:
+    type: String
+    description: Correlation ID for tracing this execution in CloudWatch Logs.
+    default: ''
 mainSteps:
   - name: enableRegions
     action: aws:executeScript
@@ -29,9 +34,17 @@ mainSteps:
         ConfigParameterName: '{{ ConfigParameterName }}'
         RegionNames: '{{ RegionNames }}'
         AccountEmails: '{{ AccountEmails }}'
+        RunId: '{{ RunId }}'
       Script: |-
         import json
         import boto3
+        import uuid
+        from datetime import datetime, timezone
+
+        def log(run_id, event, **kwargs):
+            entry = {"runId": run_id, "step": "Enable-Account-Regions", "event": event}
+            entry.update(kwargs)
+            print(json.dumps(entry))
 
         def load_config(parameter_name):
             ssm = boto3.client("ssm")
@@ -56,6 +69,12 @@ mainSteps:
             config = load_config(events["ConfigParameterName"])
             region_names = list(events.get("RegionNames", []))
             target_emails = set(events.get("AccountEmails", []))
+
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                run_id = f"enable-regions-{ts}-{uuid.uuid4().hex[:6]}"
+            log(run_id, "step_started", regions=region_names)
 
             if not region_names:
                 raise ValueError("RegionNames must contain at least one opt-in region")
@@ -92,6 +111,7 @@ mainSteps:
                 for region_name in region_names:
                     current_status = current_regions.get(region_name)
                     if current_status in ("ENABLED", "ENABLED_BY_DEFAULT"):
+                        log(run_id, "region_skipped", accountId=account_id, region=region_name, status=current_status)
                         skipped.append({
                             "accountId": account_id,
                             "accountEmail": configured_account["email"],
@@ -101,6 +121,7 @@ mainSteps:
                         continue
 
                     if current_status == "ENABLING":
+                        log(run_id, "region_already_enabling", accountId=account_id, region=region_name)
                         requested.append({
                             "accountId": account_id,
                             "accountEmail": configured_account["email"],
@@ -113,6 +134,7 @@ mainSteps:
                         AccountId=account_id,
                         RegionName=region_name,
                     )
+                    log(run_id, "region_enable_requested", accountId=account_id, region=region_name)
                     requested.append({
                         "accountId": account_id,
                         "accountEmail": configured_account["email"],
@@ -120,9 +142,18 @@ mainSteps:
                         "status": "ENABLE_REQUESTED",
                     })
 
+            log(run_id, "step_completed", requestedCount=len(requested), skippedCount=len(skipped))
             return {
                 "EnabledRegions": json.dumps(requested),
                 "SkippedRegions": json.dumps(skipped),
+                "StepMetadata": json.dumps({
+                    "step": "Enable-Account-Regions",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "succeeded",
+                    "runId": run_id,
+                    "requestedCount": len(requested),
+                    "skippedCount": len(skipped),
+                }),
             }
     outputs:
       - Name: EnabledRegions
@@ -130,4 +161,7 @@ mainSteps:
         Type: String
       - Name: SkippedRegions
         Selector: $.Payload.SkippedRegions
+        Type: String
+      - Name: StepMetadata
+        Selector: $.Payload.StepMetadata
         Type: String

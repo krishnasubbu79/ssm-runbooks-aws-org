@@ -4,6 +4,7 @@ assumeRole: '{{ AutomationAssumeRole }}'
 outputs:
   - moveAccounts.MovedAccounts
   - moveAccounts.UnchangedAccounts
+  - moveAccounts.StepMetadata
 parameters:
   AutomationAssumeRole:
     type: String
@@ -11,6 +12,10 @@ parameters:
   ConfigParameterName:
     type: String
     description: SSM Parameter Store name containing the STDB org bootstrap config.
+  RunId:
+    type: String
+    description: Correlation ID for tracing this execution in CloudWatch Logs.
+    default: ''
 mainSteps:
   - name: moveAccounts
     action: aws:executeScript
@@ -20,9 +25,22 @@ mainSteps:
       Handler: script_handler
       InputPayload:
         ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ RunId }}'
       Script: |-
         import json
+        import time
+        import uuid
         import boto3
+        from botocore.exceptions import ClientError
+        from datetime import datetime, timezone
+
+        MOVE_MAX_RETRIES = 3
+        MOVE_BASE_DELAY = 2
+
+        def log(run_id, event, **kwargs):
+            entry = {"runId": run_id, "step": "Move-Accounts-To-OUs", "event": event}
+            entry.update(kwargs)
+            print(json.dumps(entry))
 
         def load_config(parameter_name):
             ssm = boto3.client("ssm")
@@ -56,6 +74,12 @@ mainSteps:
             return parents[0]["Id"]
 
         def script_handler(events, context):
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                run_id = f"move-accounts-{ts}-{uuid.uuid4().hex[:6]}"
+            log(run_id, "step_started")
+
             config = load_config(events["ConfigParameterName"])
             orgs = boto3.client("organizations")
             root_id = get_root_id(orgs)
@@ -86,6 +110,7 @@ mainSteps:
                 source_parent_id = get_current_parent(orgs, current["Id"])
 
                 if source_parent_id == target_parent_id:
+                    log(run_id, "account_unchanged", name=current["Name"], accountId=current["Id"], ouKey=target_ou_key)
                     unchanged.append({
                         "name": current["Name"],
                         "accountId": current["Id"],
@@ -93,11 +118,29 @@ mainSteps:
                     })
                     continue
 
-                orgs.move_account(
-                    AccountId=current["Id"],
-                    SourceParentId=source_parent_id,
-                    DestinationParentId=target_parent_id,
-                )
+                last_error = None
+                for attempt in range(MOVE_MAX_RETRIES):
+                    try:
+                        orgs.move_account(
+                            AccountId=current["Id"],
+                            SourceParentId=source_parent_id,
+                            DestinationParentId=target_parent_id,
+                        )
+                        last_error = None
+                        break
+                    except ClientError as error:
+                        last_error = error
+                        code = error.response["Error"]["Code"]
+                        if code == "ConcurrentModificationException" and attempt < MOVE_MAX_RETRIES - 1:
+                            delay = MOVE_BASE_DELAY ** (attempt + 1)
+                            log(run_id, "move_retry", name=current["Name"], accountId=current["Id"], attempt=attempt+1, delay=delay)
+                            time.sleep(delay)
+                        else:
+                            raise
+                if last_error:
+                    raise last_error
+
+                log(run_id, "account_moved", name=current["Name"], accountId=current["Id"], fromParentId=source_parent_id, toParentId=target_parent_id)
                 moved.append({
                     "name": current["Name"],
                     "accountId": current["Id"],
@@ -105,9 +148,24 @@ mainSteps:
                     "toParentId": target_parent_id,
                 })
 
+            log(run_id, "step_completed", movedCount=len(moved), unchangedCount=len(unchanged))
+
             return {
                 "MovedAccounts": json.dumps(moved),
                 "UnchangedAccounts": json.dumps(unchanged),
+                "StepMetadata": json.dumps({
+                    "runId": run_id,
+                    "step": "Move-Accounts-To-OUs",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "succeeded",
+                    "movedCount": len(moved),
+                    "unchangedCount": len(unchanged),
+                    "recoveryGuidance": (
+                        "If some accounts failed to move, re-run Move-Accounts-To-OUs. "
+                        "Accounts already in the correct OU will be skipped. "
+                        "Check that the target OUs exist (run Ensure-OUs first if needed)."
+                    ),
+                }),
             }
     outputs:
       - Name: MovedAccounts
@@ -115,4 +173,7 @@ mainSteps:
         Type: String
       - Name: UnchangedAccounts
         Selector: $.Payload.UnchangedAccounts
+        Type: String
+      - Name: StepMetadata
+        Selector: $.Payload.StepMetadata
         Type: String

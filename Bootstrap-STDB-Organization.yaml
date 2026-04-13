@@ -9,6 +9,12 @@ parameters:
     type: String
     description: SSM Parameter Store name containing the STDB org bootstrap config.
     default: /stdb/org/bootstrap/config
+  RunId:
+    type: String
+    description: >-
+      Correlation ID for this bootstrap run. Used to trace all child executions
+      in CloudWatch Logs. If omitted, auto-generated from timestamp and execution context.
+    default: ''
   DiscoverRootDocumentName:
     type: String
     description: Name of the child Automation document that discovers the AWS Organizations root.
@@ -33,7 +39,52 @@ parameters:
     type: String
     description: Name of the child Automation document that creates the bootstrap role in each configured account.
     default: Create-Bootstrap-Role
+  ValidateConfigDocumentName:
+    type: String
+    description: Name of the child Automation document that validates the org bootstrap config before provisioning.
+    default: Validate-Config
 mainSteps:
+  - name: generateRunId
+    action: aws:executeScript
+    onFailure: Abort
+    nextStep: validateConfig
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        RunId: '{{ RunId }}'
+      Script: |-
+        import json
+        import uuid
+        from datetime import datetime, timezone
+
+        def script_handler(events, context):
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                short_id = uuid.uuid4().hex[:6]
+                run_id = f"bootstrap-{ts}-{short_id}"
+            print(json.dumps({
+                "runId": run_id,
+                "step": "Bootstrap-STDB-Organization",
+                "event": "run_started",
+                "message": f"Bootstrap orchestration started with RunId: {run_id}",
+            }))
+            return {"RunId": run_id}
+    outputs:
+      - Name: RunId
+        Selector: $.Payload.RunId
+        Type: String
+  - name: validateConfig
+    action: aws:executeAutomation
+    onFailure: Abort
+    nextStep: discoverRoot
+    inputs:
+      DocumentName: '{{ ValidateConfigDocumentName }}'
+      RuntimeParameters:
+        AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+        ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ generateRunId.RunId }}'
   - name: discoverRoot
     action: aws:executeAutomation
     onFailure: Abort
@@ -42,6 +93,7 @@ mainSteps:
       DocumentName: '{{ DiscoverRootDocumentName }}'
       RuntimeParameters:
         AutomationAssumeRole: '{{ AutomationAssumeRole }}'
+        RunId: '{{ generateRunId.RunId }}'
   - name: ensureOUs
     action: aws:executeAutomation
     onFailure: Abort
@@ -51,6 +103,7 @@ mainSteps:
       RuntimeParameters:
         AutomationAssumeRole: '{{ AutomationAssumeRole }}'
         ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ generateRunId.RunId }}'
   - name: createAccounts
     action: aws:executeAutomation
     onFailure: Abort
@@ -60,6 +113,7 @@ mainSteps:
       RuntimeParameters:
         AutomationAssumeRole: '{{ AutomationAssumeRole }}'
         ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ generateRunId.RunId }}'
   - name: waitForAccounts
     action: aws:executeAutomation
     onFailure: Abort
@@ -69,6 +123,7 @@ mainSteps:
       RuntimeParameters:
         AutomationAssumeRole: '{{ AutomationAssumeRole }}'
         ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ generateRunId.RunId }}'
   - name: moveAccounts
     action: aws:executeAutomation
     onFailure: Abort
@@ -78,6 +133,7 @@ mainSteps:
       RuntimeParameters:
         AutomationAssumeRole: '{{ AutomationAssumeRole }}'
         ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ generateRunId.RunId }}'
   - name: createBootstrapRole
     action: aws:executeAutomation
     onFailure: Abort
@@ -87,3 +143,4 @@ mainSteps:
       RuntimeParameters:
         AutomationAssumeRole: '{{ AutomationAssumeRole }}'
         ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ generateRunId.RunId }}'

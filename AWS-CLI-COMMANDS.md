@@ -39,6 +39,7 @@ aws ssm put-parameter \
     "accounts": [
       {"name": "stdb-log-archive", "email": "aws+stdb-log-archive@yourdomain.com", "targetOuKey": "security"},
       {"name": "stdb-delegated-admin", "email": "aws+stdb-delegated-admin@yourdomain.com", "targetOuKey": "security"},
+      {"name": "stdb-key-vault", "email": "aws+stdb-key-vault@yourdomain.com", "targetOuKey": "security"},
       {"name": "stdb-network", "email": "aws+stdb-network@yourdomain.com", "targetOuKey": "infra"},
       {"name": "stdb-processing", "email": "aws+stdb-processing@yourdomain.com", "targetOuKey": "processing"},
       {"name": "stdb-recovery", "email": "aws+stdb-recovery@yourdomain.com", "targetOuKey": "recovery"},
@@ -78,9 +79,9 @@ aws ssm put-parameter \
 |---|---|---|---|
 | `<AUTOMATION_ROLE_NAME>` | Management account | You (Step 2 below) | The IAM role that SSM Automation assumes to execute the runbooks. Trusted by `ssm.amazonaws.com`. |
 | `OrganizationAccountAccessRole` | Each child account | AWS automatically during `CreateAccount` | The default cross-account role AWS creates in every new account. The automation role assumes this to reach into child accounts. |
-| `STDBBootstrapRole` | Each child account | The `Create-Bootstrap-Role` runbook (Step 7) | A bootstrap role trusted by the management account. Used for landing zone deployment into child accounts. |
-| `STDBBootstrapRole` | Management account | The `Setup-Terraform-Local-Foundation` runbook (Step 13) | Same bootstrap role, created in the management account so Terraform has a uniform assume-role pattern across all accounts. |
-| `STDBTerraformUser` | Management account | You (Step 13f) | IAM user for local Terraform execution. Has only `sts:AssumeRole` to `STDBBootstrapRole`. |
+| `STDBBootstrapRole` | Each child account | The `Create-Bootstrap-Role` runbook (Step 8) | A bootstrap role trusted by the management account. Used for landing zone deployment into child accounts. |
+| `STDBBootstrapRole` | Management account | The `Setup-Terraform-Local-Foundation` runbook (Step 15) | Same bootstrap role, created in the management account so Terraform has a uniform assume-role pattern across all accounts. |
+| `STDBTerraformUser` | Management account | You (Step 15f) | IAM user for local Terraform execution. Has only `sts:AssumeRole` to `STDBBootstrapRole`. |
 
 ---
 
@@ -178,6 +179,36 @@ cat > /tmp/ssm-automation-permissions.json << EOF
         "iam:AttachRolePolicy"
       ],
       "Resource": "arn:aws:iam::*:role/STDBBootstrapRole"
+    },
+    {
+      "Sid": "CloudWatchLogsAccess",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:*:<MANAGEMENT_ACCOUNT_ID>:log-group:/stdb/ssm/automation/*"
+    },
+    {
+      "Sid": "CentralizedRootAccessManagement",
+      "Effect": "Allow",
+      "Action": [
+        "organizations:EnableAWSServiceAccess",
+        "organizations:ListAWSServiceAccessForOrganization",
+        "iam:EnableOrganizationsRootCredentialsManagement",
+        "iam:EnableOrganizationsRootSessions",
+        "iam:ListOrganizationsFeatures"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AssumeRootForCredentialRemoval",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRoot",
+      "Resource": "arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:root"
     }
   ]
 }
@@ -256,13 +287,128 @@ Save this ARN — it is the `AutomationAssumeRole` value for all runbook executi
 
 ---
 
-## 3. Upload the SSM Automation Documents
+## 3. Enable CloudWatch Logs for SSM Automation
+
+SSM Automation `aws:executeScript` steps can send their `print()` output to CloudWatch Logs. This is an account-level service setting — once enabled, all automation executions in the account will log to the configured log group.
+
+The runbooks use structured JSON logging with a correlation ID (`RunId`) so you can trace a complete bootstrap run across all child executions using CloudWatch Logs Insights.
+
+### 3a. Create the CloudWatch log group
+
+```bash
+aws logs create-log-group \
+  --profile orga \
+  --region <REGION> \
+  --log-group-name "/stdb/ssm/automation/executeScript"
+
+aws logs put-retention-policy \
+  --profile orga \
+  --region <REGION> \
+  --log-group-name "/stdb/ssm/automation/executeScript" \
+  --retention-in-days 90
+```
+
+### 3b. Enable SSM Automation logging to CloudWatch
+
+These two `update-service-setting` calls configure the account-level settings. The first enables CloudWatch logging for `aws:executeScript`; the second sets the target log group.
+
+```bash
+aws ssm update-service-setting \
+  --profile orga \
+  --region <REGION> \
+  --setting-id "arn:aws:ssm:<REGION>:<MANAGEMENT_ACCOUNT_ID>:servicesetting/ssm/automation/customer-script-log-destination" \
+  --setting-value "CloudWatch"
+
+aws ssm update-service-setting \
+  --profile orga \
+  --region <REGION> \
+  --setting-id "arn:aws:ssm:<REGION>:<MANAGEMENT_ACCOUNT_ID>:servicesetting/ssm/automation/customer-script-log-group-name" \
+  --setting-value "/stdb/ssm/automation/executeScript"
+```
+
+### 3c. Verify the service settings
+
+```bash
+aws ssm get-service-setting \
+  --profile orga \
+  --region <REGION> \
+  --setting-id "arn:aws:ssm:<REGION>:<MANAGEMENT_ACCOUNT_ID>:servicesetting/ssm/automation/customer-script-log-destination" \
+  --query "ServiceSetting.SettingValue" \
+  --output text
+
+aws ssm get-service-setting \
+  --profile orga \
+  --region <REGION> \
+  --setting-id "arn:aws:ssm:<REGION>:<MANAGEMENT_ACCOUNT_ID>:servicesetting/ssm/automation/customer-script-log-group-name" \
+  --query "ServiceSetting.SettingValue" \
+  --output text
+```
+
+Expected output: `CloudWatch` and `/stdb/ssm/automation/executeScript`.
+
+### 3d. Verify the log group exists
+
+```bash
+aws logs describe-log-groups \
+  --profile orga \
+  --region <REGION> \
+  --log-group-name-prefix "/stdb/ssm/automation" \
+  --query "logGroups[].{Name:logGroupName,RetentionDays:retentionInDays}" \
+  --output table
+```
+
+### 3e. Querying logs with CloudWatch Logs Insights
+
+After a bootstrap run, use the RunId to trace all log entries across child executions:
+
+```bash
+aws logs start-query \
+  --profile orga \
+  --region <REGION> \
+  --log-group-name "/stdb/ssm/automation/executeScript" \
+  --start-time $(date -d '1 hour ago' +%s) \
+  --end-time $(date +%s) \
+  --query-string 'fields @timestamp, @message | filter @message like "bootstrap-" | sort @timestamp asc | limit 200'
+```
+
+For a specific RunId:
+
+```bash
+aws logs start-query \
+  --profile orga \
+  --region <REGION> \
+  --log-group-name "/stdb/ssm/automation/executeScript" \
+  --start-time $(date -d '1 hour ago' +%s) \
+  --end-time $(date +%s) \
+  --query-string 'fields @timestamp, @message | filter @message like "<RUN_ID>" | sort @timestamp asc | limit 500'
+```
+
+Retrieve the query results:
+
+```bash
+aws logs get-query-results \
+  --profile orga \
+  --region <REGION> \
+  --query-id <QUERY_ID>
+```
+
+---
+
+## 4. Upload the SSM Automation Documents
 
 Upload child runbooks first, then the parent orchestrator.
 
-### 3a. Upload child runbooks
+### 4a. Upload child runbooks
 
 ```bash
+aws ssm create-document \
+  --profile orga \
+  --region <REGION> \
+  --name "Validate-Config" \
+  --document-type "Automation" \
+  --document-format "YAML" \
+  --content "file://Validate-Config.yaml"
+
 aws ssm create-document \
   --profile orga \
   --region <REGION> \
@@ -318,9 +464,25 @@ aws ssm create-document \
   --document-type "Automation" \
   --document-format "YAML" \
   --content "file://Enable-Account-Regions.yaml"
+
+aws ssm create-document \
+  --profile orga \
+  --region <REGION> \
+  --name "Verify-Bootstrap" \
+  --document-type "Automation" \
+  --document-format "YAML" \
+  --content "file://Verify-Bootstrap.yaml"
+
+aws ssm create-document \
+  --profile orga \
+  --region <REGION> \
+  --name "Secure-Root-Access" \
+  --document-type "Automation" \
+  --document-format "YAML" \
+  --content "file://Secure-Root-Access.yaml"
 ```
 
-### 3b. Upload the parent orchestrator
+### 4b. Upload the parent orchestrator
 
 ```bash
 aws ssm create-document \
@@ -332,7 +494,7 @@ aws ssm create-document \
   --content "file://Bootstrap-STDB-Organization.yaml"
 ```
 
-### 3c. Verify all documents are created
+### 4c. Verify all documents are created
 
 ```bash
 aws ssm list-documents \
@@ -343,7 +505,7 @@ aws ssm list-documents \
   --output table
 ```
 
-### 3d. Updating documents after changes
+### 4d. Updating documents after changes
 
 If you need to update a document after the initial upload, use `update-document` with a new version:
 
@@ -365,9 +527,9 @@ aws ssm update-document-default-version \
 
 ---
 
-## 4. Staged Execution — Phase A: Discover Root and Create OUs
+## 5. Staged Execution — Phase A: Discover Root and Create OUs
 
-### 4a. Discover the organization root
+### 5a. Discover the organization root
 
 ```bash
 aws ssm start-automation-execution \
@@ -388,7 +550,7 @@ aws ssm get-automation-execution \
   --output json
 ```
 
-### 4b. Create the OUs
+### 5b. Create the OUs
 
 ```bash
 aws ssm start-automation-execution \
@@ -413,7 +575,7 @@ aws organizations list-organizational-units-for-parent \
 
 ---
 
-## 5. Staged Execution — Phase B: Create Accounts
+## 6. Staged Execution — Phase B: Create Accounts
 
 ### 5a. Create the accounts
 
@@ -459,7 +621,7 @@ aws organizations list-accounts \
 
 ---
 
-## 6. Staged Execution — Phase C: Move Accounts to OUs
+## 7. Staged Execution — Phase C: Move Accounts to OUs
 
 ### 6a. Move accounts
 
@@ -501,7 +663,7 @@ done
 
 ---
 
-## 7. Staged Execution — Phase D: Create Bootstrap Role
+## 8. Staged Execution — Phase D: Create Bootstrap Role
 
 ### 7a. Create the bootstrap role in each account
 
@@ -547,9 +709,45 @@ done
 
 ---
 
-## 8. Staged Execution — Phase E: Enable Opt-In Regions
+## 9. Staged Execution — Phase E: Secure Root Access
 
-### 8a. Enable regions
+### 9a. Enable centralized root access and remove root credentials
+
+```bash
+aws ssm start-automation-execution \
+  --profile orga \
+  --region <REGION> \
+  --document-name "Secure-Root-Access" \
+  --parameters \
+    "AutomationAssumeRole=arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/<AUTOMATION_ROLE_NAME>,ConfigParameterName=/stdb/org/bootstrap/config"
+```
+
+### 9b. Verify the execution
+
+```bash
+aws ssm get-automation-execution \
+  --profile orga \
+  --region <REGION> \
+  --automation-execution-id <EXECUTION_ID> \
+  --query "AutomationExecution.{Status:AutomationExecutionStatus,Outputs:Outputs}" \
+  --output json
+```
+
+### 9c. Verify centralized root features are enabled
+
+```bash
+aws iam list-organizations-features \
+  --profile orga \
+  --output json
+```
+
+Expected output should include both `RootCredentialsManagement` and `RootSessions` in the `EnabledFeatures` list.
+
+---
+
+## 10. Staged Execution — Phase F: Enable Opt-In Regions
+
+### 10a. Enable regions
 
 ```bash
 aws ssm start-automation-execution \
@@ -560,7 +758,7 @@ aws ssm start-automation-execution \
     "AutomationAssumeRole=arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/<AUTOMATION_ROLE_NAME>,ConfigParameterName=/stdb/org/bootstrap/config,RegionNames=ap-south-2"
 ```
 
-### 8b. Verify region status
+### 10b. Verify region status
 
 ```bash
 for ACCOUNT_ID in $(aws organizations list-accounts \
@@ -579,7 +777,7 @@ done
 
 ---
 
-## 9. Full Orchestrated Execution
+## 11. Full Orchestrated Execution
 
 Once the staged rollout has been verified, subsequent runs can use the parent orchestrator:
 
@@ -616,7 +814,7 @@ aws ssm describe-automation-executions \
 
 ---
 
-## 10. Teardown — Upload Teardown Runbooks
+## 12. Teardown — Upload Teardown Runbooks
 
 The teardown runbooks live in `account-deletion/`. Upload them the same way as the bootstrap runbooks.
 
@@ -682,11 +880,11 @@ aws iam put-role-policy \
 
 ---
 
-## 11. Teardown — Staged Execution
+## 13. Teardown — Staged Execution
 
 Run teardown in phases, verifying after each step.
 
-### 11a. Remove bootstrap roles from child accounts
+### 13a. Remove bootstrap roles from child accounts
 
 ```bash
 aws ssm start-automation-execution \
@@ -697,7 +895,7 @@ aws ssm start-automation-execution \
     "AutomationAssumeRole=arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/<AUTOMATION_ROLE_NAME>,ConfigParameterName=/stdb/org/bootstrap/config"
 ```
 
-### 11b. Move accounts back to root
+### 13b. Move accounts back to root
 
 ```bash
 aws ssm start-automation-execution \
@@ -720,7 +918,7 @@ aws organizations list-accounts-for-parent \
   --output table
 ```
 
-### 11c. Close the accounts
+### 13c. Close the accounts
 
 ```bash
 aws ssm start-automation-execution \
@@ -740,7 +938,7 @@ aws organizations list-accounts \
   --output table
 ```
 
-### 11d. Delete the OUs
+### 13d. Delete the OUs
 
 ```bash
 aws ssm start-automation-execution \
@@ -765,7 +963,7 @@ aws organizations list-organizational-units-for-parent \
 
 ---
 
-## 12. Teardown — Full Orchestrated Execution
+## 14. Teardown — Full Orchestrated Execution
 
 Once you are confident the staged teardown works, subsequent runs can use the parent orchestrator:
 
@@ -780,7 +978,7 @@ aws ssm start-automation-execution \
 
 ---
 
-## 13. Setup Terraform Local Foundation
+## 15. Setup Terraform Local Foundation
 
 This section provisions the Terraform prerequisites for running Terraform from your local laptop against all STDB accounts. The runbook creates:
 
@@ -792,7 +990,7 @@ After this runbook completes, you can run `terraform plan` and `terraform apply`
 
 On re-run, the runbook is intended to be convergent at both the resource and policy level. If the Terraform state KMS key policy or S3 bucket policy drifts, the runbook should repair it.
 
-### 13a. Add Terraform foundation permissions to the automation role
+### 15a. Add Terraform foundation permissions to the automation role
 
 **You must run this step before executing the runbook.** The automation role created in Step 2 does not include the full set of KMS, S3 bucket-policy, or management-account IAM role permissions required by the convergent local-foundation runbook. This step adds them as a separate inline policy.
 
@@ -867,9 +1065,9 @@ aws iam list-role-policies \
 You should see these inline policies:
 - `STDBBootstrapAutomationPolicy` (from Step 2d)
 - `STDBAutomationExecutionPolicy` (from Step 2f)
-- `STDBTerraformFoundationPolicy` (from Step 13a above)
+- `STDBTerraformFoundationPolicy` (from Step 15a above)
 
-### 13b. Upload the runbook
+### 15b. Upload the runbook
 
 ```bash
 aws ssm create-document \
@@ -881,7 +1079,7 @@ aws ssm create-document \
   --content "file://Setup-Terraform-Local-Foundation.yaml"
 ```
 
-### 13c. Execute the runbook
+### 15c. Execute the runbook
 
 ```bash
 aws ssm start-automation-execution \
@@ -894,7 +1092,7 @@ aws ssm start-automation-execution \
   }'
 ```
 
-### 13d. Monitor execution
+### 15d. Monitor execution
 
 ```bash
 aws ssm get-automation-execution \
@@ -905,7 +1103,7 @@ aws ssm get-automation-execution \
   --output json
 ```
 
-### 13e. Retrieve the outputs
+### 15e. Retrieve the outputs
 
 Save these values — you will need them for your Terraform backend and provider configuration:
 
@@ -932,7 +1130,7 @@ Expected outputs:
 | `ensureStateBucket.BucketWasCreated` | `true` if the bucket was created in this run |
 | `ensureBootstrapRoleInManagementAccount.BootstrapRoleArn` | Bootstrap role ARN in management account |
 
-### 13f. Create the Terraform IAM user
+### 15f. Create the Terraform IAM user
 
 Create a dedicated IAM user for Terraform. This user only needs `sts:AssumeRole` — all actual permissions come from `STDBBootstrapRole`.
 
@@ -968,7 +1166,7 @@ aws iam create-access-key \
 
 Save the `AccessKeyId` and `SecretAccessKey` from the output.
 
-### 13g. Configure AWS CLI profiles
+### 15g. Configure AWS CLI profiles
 
 Add the IAM user credentials to `~/.aws/credentials`:
 
@@ -1017,7 +1215,7 @@ aws sts get-caller-identity --profile stdb-mgmt
 aws sts get-caller-identity --profile stdb-security
 ```
 
-### 13h. Terraform backend configuration
+### 15h. Terraform backend configuration
 
 Use this in your Terraform code. Each stack uses a unique `key`:
 
@@ -1035,7 +1233,7 @@ terraform {
 }
 ```
 
-### 13i. Terraform provider configuration
+### 15i. Terraform provider configuration
 
 Each account gets its own provider. Terraform assumes `STDBBootstrapRole` in the target account:
 
@@ -1086,7 +1284,7 @@ resource "aws_s3_bucket" "logs" {
 }
 ```
 
-### 13j. Verify end-to-end
+### 15j. Verify end-to-end
 
 ```bash
 cd your-terraform-directory/
@@ -1098,7 +1296,7 @@ If `terraform init` succeeds, the backend (S3 + KMS) and credentials are working
 
 ---
 
-## 14. Cleanup Commands (Reference Only)
+## 16. Cleanup Commands (Reference Only)
 
 These commands are provided for reference. Use with caution.
 

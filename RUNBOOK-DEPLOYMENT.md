@@ -22,19 +22,24 @@ Before running these automations, the following should already be true:
 - the automation execution role exists and has the required permissions
 - the org bootstrap config has been stored in `SSM Parameter Store`
 - if the config parameter is a `SecureString` using a customer-managed KMS key, the automation role also has `kms:Decrypt` on that key
+- CloudWatch Logs is configured for SSM Automation executeScript output (see the CLI commands guide for setup)
+- AWS Organizations trusted access for IAM is required only when running the standalone `Secure-Root-Access` runbook. That runbook enables it automatically.
 
 ## Files
 
 Runbooks:
 
 - [Bootstrap-STDB-Organization.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Bootstrap-STDB-Organization.yaml)
+- [Validate-Config.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Validate-Config.yaml)
 - [Discover-Root.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Discover-Root.yaml)
 - [Ensure-OUs.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Ensure-OUs.yaml)
 - [Create-Accounts.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Create-Accounts.yaml)
 - [Wait-For-Account-Creation.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Wait-For-Account-Creation.yaml)
 - [Move-Accounts-To-OUs.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Move-Accounts-To-OUs.yaml)
 - [Create-Bootstrap-Role.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Create-Bootstrap-Role.yaml)
+- [Secure-Root-Access.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Secure-Root-Access.yaml)
 - [Enable-Account-Regions.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Enable-Account-Regions.yaml)
+- [Verify-Bootstrap.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Verify-Bootstrap.yaml)
 
 Sample config:
 
@@ -49,6 +54,7 @@ The recommended approach for STDB is to use **plus-addressing aliases** on a sin
 ```
 aws+stdb-log-archive@yourdomain.com
 aws+stdb-delegated-admin@yourdomain.com
+aws+stdb-key-vault@yourdomain.com
 aws+stdb-network@yourdomain.com
 aws+stdb-processing@yourdomain.com
 aws+stdb-recovery@yourdomain.com
@@ -131,6 +137,17 @@ At minimum, that role should have permissions for:
 - `ssm:DescribeAutomationStepExecutions`
 - `ssm:DescribeDocument`
 - `ssm:GetDocument`
+- `logs:CreateLogGroup`
+- `logs:CreateLogStream`
+- `logs:DescribeLogGroups`
+- `logs:DescribeLogStreams`
+- `logs:PutLogEvents`
+- `organizations:EnableAWSServiceAccess`
+- `organizations:ListAWSServiceAccessForOrganization`
+- `iam:EnableOrganizationsRootCredentialsManagement`
+- `iam:EnableOrganizationsRootSessions`
+- `iam:ListOrganizationsFeatures`
+- `sts:AssumeRoot`
 
 ## Step 3: Create the SSM Automation Documents
 
@@ -139,13 +156,16 @@ Upload each YAML file in this folder as a separate `SSM Automation` document.
 Recommended document names:
 
 - `Bootstrap-STDB-Organization`
+- `Validate-Config`
 - `Discover-Root`
 - `Ensure-OUs`
 - `Create-Accounts`
 - `Wait-For-Account-Creation`
 - `Move-Accounts-To-OUs`
 - `Create-Bootstrap-Role`
+- `Secure-Root-Access`
 - `Enable-Account-Regions`
+- `Verify-Bootstrap`
 
 The parent runbook references the child runbooks by these names unless you override them through parameters.
 
@@ -159,6 +179,8 @@ Before running the automation, verify:
 - none of the email addresses are already associated with an existing AWS account
 - the `orgAccessRoleName` matches the role name created during `CreateAccount`
 - the config parameter path matches the runbook input
+
+You can also run `Validate-Config` as a standalone check before attempting the full bootstrap. It will verify the config schema, field uniqueness, and OU key references without making any changes to the organization.
 
 ## Recommended First Execution Strategy
 
@@ -233,17 +255,25 @@ Verify:
 
 Once the first staged rollout is successful, the normal sequence is:
 
-1. `Discover-Root`
-2. `Ensure-OUs`
-3. `Create-Accounts`
-4. `Wait-For-Account-Creation`
-5. `Move-Accounts-To-OUs`
-6. `Create-Bootstrap-Role`
-7. `Enable-Account-Regions`
+1. `Validate-Config`
+2. `Discover-Root`
+3. `Ensure-OUs`
+4. `Create-Accounts`
+5. `Wait-For-Account-Creation`
+6. `Move-Accounts-To-OUs`
+7. `Create-Bootstrap-Role`
+8. `Enable-Account-Regions`
+9. `Verify-Bootstrap`
 
 Or simply run:
 
-1. `Bootstrap-STDB-Organization`
+1. `Bootstrap-STDB-Organization` (steps 1-7 are automated by the parent orchestrator)
+2. `Enable-Account-Regions` (separate, staged after bootstrap)
+3. `Verify-Bootstrap` (post-run verification)
+
+`Secure-Root-Access` is intentionally not part of the parent orchestrator. Run it as a separate post-bootstrap hardening step only after account bootstrap has been verified.
+
+All executions emit structured JSON logs with a RunId correlation ID. When CloudWatch Logs is enabled for SSM Automation, use CloudWatch Logs Insights to trace a full bootstrap run across all child execution log streams.
 
 ## Inputs to Use
 
@@ -258,6 +288,7 @@ Example:
 
 - `AutomationAssumeRole = arn:aws:iam::<management-account-id>:role/<automation-role>`
 - `ConfigParameterName = /stdb/org/bootstrap/config`
+- `RunId` (optional — auto-generated if omitted)
 
 ### Child Runbooks
 
@@ -274,6 +305,12 @@ Each child runbook takes:
 
 - `RegionNames`
 - optional `AccountEmails`
+
+`Secure-Root-Access` also takes:
+
+- `AutomationAssumeRole` (required)
+- `ConfigParameterName` (required)
+- `RunId` (optional — auto-generated if omitted)
 
 ## Re-run Behavior
 
@@ -307,6 +344,7 @@ After execution:
 - account placement verified
 - bootstrap role verified
 - opt-in Regions verified where applicable
+- `Verify-Bootstrap` run confirms overall state matches config (or run manually to check specific mismatches)
 
 ## Next Phase
 

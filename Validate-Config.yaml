@@ -1,0 +1,222 @@
+description: Validates the STDB org bootstrap config before any provisioning steps run.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+outputs:
+  - validateConfig.ValidationResult
+  - validateConfig.ConfigSummary
+  - validateConfig.RunId
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role ARN that SSM Automation should assume.
+  ConfigParameterName:
+    type: String
+    description: SSM Parameter Store name containing the STDB org bootstrap config.
+  RunId:
+    type: String
+    description: Correlation ID for tracing this execution in CloudWatch Logs.
+    default: ''
+mainSteps:
+  - name: validateConfig
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: script_handler
+      InputPayload:
+        ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ RunId }}'
+      Script: |-
+        import json
+        import boto3
+        import uuid
+        from datetime import datetime, timezone
+
+        SUPPORTED_VERSIONS = ["1.0"]
+
+        REQUIRED_BOOTSTRAP_FIELDS = [
+            "managementAccountId",
+            "roleName",
+            "orgAccessRoleName",
+        ]
+
+        def log(run_id, event, **kwargs):
+            entry = {"runId": run_id, "step": "Validate-Config", "event": event}
+            entry.update(kwargs)
+            print(json.dumps(entry))
+
+        def load_config(parameter_name):
+            ssm = boto3.client("ssm")
+            response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            return json.loads(response["Parameter"]["Value"])
+
+        def validate_version(config, errors):
+            version = config.get("version")
+            if not version:
+                errors.append("Missing required field: version")
+            elif version not in SUPPORTED_VERSIONS:
+                errors.append(
+                    f"Unsupported config version '{version}'. "
+                    f"Supported versions: {SUPPORTED_VERSIONS}"
+                )
+
+        def validate_bootstrap_fields(config, errors):
+            bootstrap = config.get("bootstrap")
+            if not bootstrap:
+                errors.append("Missing required section: bootstrap")
+                return
+            if not isinstance(bootstrap, dict):
+                errors.append("Section 'bootstrap' must be a JSON object")
+                return
+            for field in REQUIRED_BOOTSTRAP_FIELDS:
+                if not bootstrap.get(field):
+                    errors.append(f"Missing required bootstrap field: {field}")
+
+        def validate_ou_uniqueness(config, errors):
+            ous = config.get("organizationalUnits", [])
+            if not ous:
+                errors.append("No organizational units defined in config")
+                return
+
+            keys = [ou.get("key", "") for ou in ous]
+            names = [ou.get("name", "") for ou in ous]
+
+            key_dupes = [k for k in keys if keys.count(k) > 1]
+            if key_dupes:
+                errors.append(
+                    f"Duplicate OU keys found: {sorted(set(key_dupes))}"
+                )
+
+            name_dupes = [n for n in names if names.count(n) > 1]
+            if name_dupes:
+                errors.append(
+                    f"Duplicate OU names found: {sorted(set(name_dupes))}"
+                )
+
+            for ou in ous:
+                if not ou.get("key"):
+                    errors.append(f"OU missing required field 'key': {ou}")
+                if not ou.get("name"):
+                    errors.append(f"OU missing required field 'name': {ou}")
+                if not ou.get("parentKey"):
+                    errors.append(
+                        f"OU '{ou.get('key', '?')}' missing required field 'parentKey'"
+                    )
+
+        def validate_account_uniqueness(config, errors):
+            accounts = config.get("accounts", [])
+            if not accounts:
+                errors.append("No accounts defined in config")
+                return
+
+            names = [acc.get("name", "") for acc in accounts]
+            emails = [acc.get("email", "") for acc in accounts]
+
+            name_dupes = [n for n in names if names.count(n) > 1]
+            if name_dupes:
+                errors.append(
+                    f"Duplicate account names found: {sorted(set(name_dupes))}"
+                )
+
+            email_dupes = [e for e in emails if emails.count(e) > 1]
+            if email_dupes:
+                errors.append(
+                    f"Duplicate account emails found: {sorted(set(email_dupes))}"
+                )
+
+            for acc in accounts:
+                if not acc.get("name"):
+                    errors.append(f"Account missing required field 'name': {acc}")
+                if not acc.get("email"):
+                    errors.append(f"Account missing required field 'email': {acc}")
+                if not acc.get("targetOuKey"):
+                    errors.append(
+                        f"Account '{acc.get('name', '?')}' missing required field 'targetOuKey'"
+                    )
+
+        def validate_ou_references(config, errors):
+            ou_keys = {
+                ou.get("key") for ou in config.get("organizationalUnits", [])
+            }
+            for acc in config.get("accounts", []):
+                target = acc.get("targetOuKey")
+                if target and target not in ou_keys:
+                    errors.append(
+                        f"Account '{acc.get('name', '?')}' references "
+                        f"undefined OU key '{target}'. "
+                        f"Valid keys: {sorted(ou_keys)}"
+                    )
+
+        def build_summary(config):
+            return {
+                "version": config.get("version"),
+                "managementAccountId": config.get("bootstrap", {}).get(
+                    "managementAccountId"
+                ),
+                "ouCount": len(config.get("organizationalUnits", [])),
+                "accountCount": len(config.get("accounts", [])),
+                "ouKeys": [
+                    ou.get("key") for ou in config.get("organizationalUnits", [])
+                ],
+                "accountNames": [
+                    acc.get("name") for acc in config.get("accounts", [])
+                ],
+            }
+
+        def script_handler(events, context):
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                run_id = f"validate-config-{ts}-{uuid.uuid4().hex[:6]}"
+
+            log(run_id, "validation_started")
+
+            config = load_config(events["ConfigParameterName"])
+
+            log(run_id, "config_loaded", version=config.get("version"), ouCount=len(config.get("organizationalUnits",[])), accountCount=len(config.get("accounts",[])))
+
+            errors = []
+            validate_version(config, errors)
+            validate_bootstrap_fields(config, errors)
+            validate_ou_uniqueness(config, errors)
+            validate_account_uniqueness(config, errors)
+            validate_ou_references(config, errors)
+
+            summary = build_summary(config)
+
+            if errors:
+                log(run_id, "validation_failed", errorCount=len(errors), errors=errors)
+                raise ValueError(
+                    f"Config validation failed with {len(errors)} error(s):\n"
+                    + "\n".join(f"  - {e}" for e in errors)
+                )
+
+            log(run_id, "validation_passed", checks=7)
+
+            return {
+                "ValidationResult": json.dumps({
+                    "status": "PASSED",
+                    "checks": [
+                        "version_supported",
+                        "bootstrap_fields_present",
+                        "ou_keys_unique",
+                        "ou_names_unique",
+                        "account_names_unique",
+                        "account_emails_unique",
+                        "ou_references_valid",
+                    ],
+                    "errorCount": 0,
+                }),
+                "ConfigSummary": json.dumps(summary),
+                "RunId": run_id,
+            }
+    outputs:
+      - Name: ValidationResult
+        Selector: $.Payload.ValidationResult
+        Type: String
+      - Name: ConfigSummary
+        Selector: $.Payload.ConfigSummary
+        Type: String
+      - Name: RunId
+        Selector: $.Payload.RunId
+        Type: String

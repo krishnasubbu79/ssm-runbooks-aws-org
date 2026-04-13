@@ -4,6 +4,7 @@ assumeRole: '{{ AutomationAssumeRole }}'
 outputs:
   - createBootstrapRole.CreatedRoles
   - createBootstrapRole.UpdatedRoles
+  - createBootstrapRole.StepMetadata
 parameters:
   AutomationAssumeRole:
     type: String
@@ -11,6 +12,10 @@ parameters:
   ConfigParameterName:
     type: String
     description: SSM Parameter Store name containing the STDB org bootstrap config.
+  RunId:
+    type: String
+    description: Correlation ID for tracing this execution in CloudWatch Logs.
+    default: ''
 mainSteps:
   - name: createBootstrapRole
     action: aws:executeScript
@@ -21,10 +26,22 @@ mainSteps:
       Handler: script_handler
       InputPayload:
         ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ RunId }}'
       Script: |-
         import json
+        import time
+        import uuid
         import boto3
         from botocore.exceptions import ClientError
+        from datetime import datetime, timezone
+
+        ASSUME_ROLE_MAX_RETRIES = 5
+        ASSUME_ROLE_BASE_DELAY = 2
+
+        def log(run_id, event, **kwargs):
+            entry = {"runId": run_id, "step": "Create-Bootstrap-Role", "event": event}
+            entry.update(kwargs)
+            print(json.dumps(entry))
 
         def load_config(parameter_name):
             ssm = boto3.client("ssm")
@@ -38,19 +55,32 @@ mainSteps:
                 accounts.extend(page.get("Accounts", []))
             return accounts
 
-        def assume_into_account(account_id, role_name):
+        def assume_into_account(account_id, role_name, run_id=""):
             sts = boto3.client("sts")
-            response = sts.assume_role(
-                RoleArn=f"arn:aws:iam::{account_id}:role/{role_name}",
-                RoleSessionName="SSMAutomationBootstrapRoleSetup",
-            )
-            creds = response["Credentials"]
-            return boto3.client(
-                "iam",
-                aws_access_key_id=creds["AccessKeyId"],
-                aws_secret_access_key=creds["SecretAccessKey"],
-                aws_session_token=creds["SessionToken"],
-            )
+            last_error = None
+            for attempt in range(ASSUME_ROLE_MAX_RETRIES):
+                try:
+                    response = sts.assume_role(
+                        RoleArn=f"arn:aws:iam::{account_id}:role/{role_name}",
+                        RoleSessionName="SSMAutomationBootstrapRoleSetup",
+                    )
+                    creds = response["Credentials"]
+                    return boto3.client(
+                        "iam",
+                        aws_access_key_id=creds["AccessKeyId"],
+                        aws_secret_access_key=creds["SecretAccessKey"],
+                        aws_session_token=creds["SessionToken"],
+                    )
+                except ClientError as error:
+                    last_error = error
+                    code = error.response["Error"]["Code"]
+                    if code in ("AccessDenied", "AccessDeniedException") and attempt < ASSUME_ROLE_MAX_RETRIES - 1:
+                        delay = ASSUME_ROLE_BASE_DELAY ** (attempt + 1)
+                        log(run_id, "assume_role_retry", accountId=account_id, attempt=attempt+1, delay=delay)
+                        time.sleep(delay)
+                    else:
+                        raise
+            raise last_error
 
         def ensure_role(iam_client, role_name, management_account_id):
             assume_role_policy = {
@@ -93,6 +123,12 @@ mainSteps:
             return role_existed
 
         def script_handler(events, context):
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                run_id = f"create-bootstrap-role-{ts}-{uuid.uuid4().hex[:6]}"
+            log(run_id, "step_started")
+
             config = load_config(events["ConfigParameterName"])
             orgs = boto3.client("organizations")
             accounts = {account["Email"]: account for account in list_accounts(orgs)}
@@ -109,7 +145,8 @@ mainSteps:
                 if not current:
                     raise ValueError(f"Account not found for email {account['email']}")
 
-                iam_client = assume_into_account(current["Id"], org_access_role_name)
+                log(run_id, "assuming_into_account", accountId=current["Id"], roleName=org_access_role_name)
+                iam_client = assume_into_account(current["Id"], org_access_role_name, run_id)
                 existed = ensure_role(
                     iam_client,
                     bootstrap_role_name,
@@ -122,13 +159,30 @@ mainSteps:
                     "roleName": bootstrap_role_name,
                 }
                 if existed:
+                    log(run_id, "role_updated", accountId=current["Id"], roleName=bootstrap_role_name)
                     updated.append(item)
                 else:
+                    log(run_id, "role_created", accountId=current["Id"], roleName=bootstrap_role_name)
                     created.append(item)
+
+            log(run_id, "step_completed", createdCount=len(created), updatedCount=len(updated))
 
             return {
                 "CreatedRoles": json.dumps(created),
                 "UpdatedRoles": json.dumps(updated),
+                "StepMetadata": json.dumps({
+                    "runId": run_id,
+                    "step": "Create-Bootstrap-Role",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "succeeded",
+                    "createdCount": len(created),
+                    "updatedCount": len(updated),
+                    "recoveryGuidance": (
+                        "If role creation failed for some accounts, re-run Create-Bootstrap-Role. "
+                        "Accounts where the role already exists will be updated rather than duplicated. "
+                        "If AssumeRole fails, wait 30-60 seconds for IAM eventual consistency and retry."
+                    ),
+                }),
             }
     outputs:
       - Name: CreatedRoles
@@ -136,4 +190,7 @@ mainSteps:
         Type: String
       - Name: UpdatedRoles
         Selector: $.Payload.UpdatedRoles
+        Type: String
+      - Name: StepMetadata
+        Selector: $.Payload.StepMetadata
         Type: String

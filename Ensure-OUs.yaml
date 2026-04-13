@@ -5,6 +5,7 @@ outputs:
   - ensureOUs.RootId
   - ensureOUs.OuMap
   - ensureOUs.CreatedOus
+  - ensureOUs.StepMetadata
 parameters:
   AutomationAssumeRole:
     type: String
@@ -12,6 +13,10 @@ parameters:
   ConfigParameterName:
     type: String
     description: SSM Parameter Store name containing the STDB org bootstrap config.
+  RunId:
+    type: String
+    description: Correlation ID for tracing this execution in CloudWatch Logs.
+    default: ''
 mainSteps:
   - name: ensureOUs
     action: aws:executeScript
@@ -21,9 +26,17 @@ mainSteps:
       Handler: script_handler
       InputPayload:
         ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ RunId }}'
       Script: |-
         import json
         import boto3
+        import uuid
+        from datetime import datetime, timezone
+
+        def log(run_id, event, **kwargs):
+            entry = {"runId": run_id, "step": "Ensure-OUs", "event": event}
+            entry.update(kwargs)
+            print(json.dumps(entry))
 
         def load_config(parameter_name):
             ssm = boto3.client("ssm")
@@ -44,9 +57,18 @@ mainSteps:
             return ous
 
         def script_handler(events, context):
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                run_id = f"ensure-ous-{ts}-{uuid.uuid4().hex[:6]}"
+            log(run_id, "step_started")
+
             config = load_config(events["ConfigParameterName"])
+            log(run_id, "config_loaded", ouCount=len(config.get("organizationalUnits", [])))
+
             orgs = boto3.client("organizations")
             root_id = get_root_id(orgs)
+            log(run_id, "root_discovered", rootId=root_id)
             existing = {
                 ou["Name"]: ou["Id"]
                 for ou in list_ous_for_parent(orgs, root_id)
@@ -62,6 +84,7 @@ mainSteps:
                 name = ou["name"]
                 if name in existing:
                     ou_id = existing[name]
+                    log(run_id, "ou_exists", name=name, ouId=ou_id)
                 else:
                     response = orgs.create_organizational_unit(
                         ParentId=root_id,
@@ -70,6 +93,7 @@ mainSteps:
                     ou_id = response["OrganizationalUnit"]["Id"]
                     existing[name] = ou_id
                     created.append({"key": ou["key"], "name": name, "id": ou_id})
+                    log(run_id, "ou_created", key=ou["key"], name=name, ouId=ou_id)
 
                 ou_map[ou["key"]] = {
                     "name": name,
@@ -77,10 +101,20 @@ mainSteps:
                     "parentId": root_id,
                 }
 
+            log(run_id, "step_completed", createdCount=len(created), existingCount=len(ou_map) - len(created))
+
             return {
                 "RootId": root_id,
                 "OuMap": json.dumps(ou_map),
                 "CreatedOus": json.dumps(created),
+                "StepMetadata": json.dumps({
+                    "runId": run_id,
+                    "step": "Ensure-OUs",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "succeeded",
+                    "createdCount": len(created),
+                    "existingCount": len(ou_map) - len(created),
+                }),
             }
     outputs:
       - Name: RootId
@@ -91,4 +125,7 @@ mainSteps:
         Type: String
       - Name: CreatedOus
         Selector: $.Payload.CreatedOus
+        Type: String
+      - Name: StepMetadata
+        Selector: $.Payload.StepMetadata
         Type: String

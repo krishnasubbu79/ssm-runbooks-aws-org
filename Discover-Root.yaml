@@ -9,6 +9,10 @@ parameters:
   AutomationAssumeRole:
     type: String
     description: IAM role ARN that SSM Automation should assume.
+  RunId:
+    type: String
+    description: Correlation ID for tracing this execution in CloudWatch Logs.
+    default: ''
 mainSteps:
   - name: discoverRoot
     action: aws:executeScript
@@ -16,10 +20,26 @@ mainSteps:
     inputs:
       Runtime: python3.11
       Handler: script_handler
+      InputPayload:
+        RunId: '{{ RunId }}'
       Script: |-
+        import json
+        import uuid
         import boto3
+        from datetime import datetime, timezone
+
+        def log(run_id, event, **kwargs):
+            entry = {"runId": run_id, "step": "Discover-Root", "event": event}
+            entry.update(kwargs)
+            print(json.dumps(entry))
 
         def script_handler(events, context):
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                run_id = f"discover-root-{ts}-{uuid.uuid4().hex[:6]}"
+            log(run_id, "step_started")
+
             client = boto3.client("organizations")
             response = client.list_roots()
             roots = response.get("Roots", [])
@@ -27,7 +47,10 @@ mainSteps:
                 raise ValueError(f"Expected exactly one root, found {len(roots)}")
 
             root = roots[0]
+            log(run_id, "root_discovered", rootId=root["Id"], rootName=root["Name"])
+
             return {
+                "RunId": run_id,
                 "RootId": root["Id"],
                 "RootArn": root["Arn"],
                 "RootName": root["Name"],

@@ -4,6 +4,7 @@ assumeRole: '{{ AutomationAssumeRole }}'
 outputs:
   - waitForAccounts.ResolvedAccounts
   - waitForAccounts.FailedAccounts
+  - waitForAccounts.StepMetadata
 parameters:
   AutomationAssumeRole:
     type: String
@@ -11,6 +12,10 @@ parameters:
   ConfigParameterName:
     type: String
     description: SSM Parameter Store name containing the STDB org bootstrap config.
+  RunId:
+    type: String
+    description: Correlation ID for tracing this execution in CloudWatch Logs.
+    default: ''
 mainSteps:
   - name: waitForAccounts
     action: aws:executeScript
@@ -21,10 +26,19 @@ mainSteps:
       Handler: script_handler
       InputPayload:
         ConfigParameterName: '{{ ConfigParameterName }}'
+        RunId: '{{ RunId }}'
       Script: |-
         import json
         import time
+        import random
         import boto3
+        import uuid
+        from datetime import datetime, timezone
+
+        def log(run_id, event, **kwargs):
+            entry = {"runId": run_id, "step": "Wait-For-Account-Creation", "event": event}
+            entry.update(kwargs)
+            print(json.dumps(entry))
 
         def load_config(parameter_name):
             ssm = boto3.client("ssm")
@@ -46,6 +60,12 @@ mainSteps:
             return statuses
 
         def script_handler(events, context):
+            run_id = events.get("RunId", "").strip()
+            if not run_id:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                run_id = f"wait-accounts-{ts}-{uuid.uuid4().hex[:6]}"
+            log(run_id, "step_started")
+
             config = load_config(events["ConfigParameterName"])
             orgs = boto3.client("organizations")
 
@@ -68,10 +88,21 @@ mainSteps:
                 else:
                     missing_emails.add(account["email"])
 
+            log(run_id, "existing_accounts_resolved", count=len(resolved), missingCount=len(missing_emails))
+
             if not missing_emails:
+                log(run_id, "step_completed_early", message="All accounts already exist", resolvedCount=len(resolved))
                 return {
                     "ResolvedAccounts": json.dumps(resolved),
                     "FailedAccounts": json.dumps([]),
+                    "StepMetadata": json.dumps({
+                        "step": "Wait-For-Account-Creation",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "status": "succeeded",
+                        "runId": run_id,
+                        "resolvedCount": len(resolved),
+                        "failedCount": 0,
+                    }),
                 }
 
             # Find in-progress creation requests that match missing emails
@@ -119,12 +150,14 @@ mainSteps:
                                 missing_emails.discard(acc["email"])
                                 resolved[-1]["email"] = acc["email"]
                                 break
+                        log(run_id, "account_creation_succeeded", name=status["AccountName"], accountId=status["AccountId"])
                     elif state == "FAILED":
                         failed.append({
                             "name": status["AccountName"],
                             "requestId": request_id,
                             "failureReason": status.get("FailureReason", "unknown"),
                         })
+                        log(run_id, "account_creation_failed", name=status["AccountName"], reason=status.get("FailureReason", "unknown"))
                         for acc in config.get("accounts", []):
                             if acc["name"] == status["AccountName"]:
                                 missing_emails.discard(acc["email"])
@@ -160,16 +193,32 @@ mainSteps:
                         f"Timed out waiting for accounts: {sorted(missing_emails)}"
                     )
 
-                time.sleep(30)
+                log(run_id, "polling", pendingCount=len(pending_ids), missingCount=len(missing_emails))
+                jitter = random.uniform(0, 10)
+                time.sleep(30 + jitter)
 
             if failed:
                 raise RuntimeError(
                     f"Account creation failed for: {json.dumps(failed)}"
                 )
 
+            log(run_id, "step_completed", resolvedCount=len(resolved), failedCount=len(failed))
             return {
                 "ResolvedAccounts": json.dumps(resolved),
                 "FailedAccounts": json.dumps(failed),
+                "StepMetadata": json.dumps({
+                    "step": "Wait-For-Account-Creation",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "succeeded",
+                    "runId": run_id,
+                    "resolvedCount": len(resolved),
+                    "failedCount": len(failed),
+                    "recoveryGuidance": (
+                        "If accounts failed creation, check FailedAccounts for failure reasons. "
+                        "Common causes: email already in use, account limit reached. "
+                        "Fix the root cause, then re-run Create-Accounts followed by Wait-For-Account-Creation."
+                    ),
+                }),
             }
     outputs:
       - Name: ResolvedAccounts
@@ -177,4 +226,7 @@ mainSteps:
         Type: String
       - Name: FailedAccounts
         Selector: $.Payload.FailedAccounts
+        Type: String
+      - Name: StepMetadata
+        Selector: $.Payload.StepMetadata
         Type: String
