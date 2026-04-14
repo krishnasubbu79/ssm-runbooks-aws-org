@@ -152,7 +152,7 @@ mainSteps:
 
             # Delete login profile (root password)
             try:
-                iam_root.delete_login_profile(UserName="root")
+                iam_root.delete_login_profile()
                 results["loginProfileDeleted"] = True
                 log(run_id, "root_login_profile_deleted", accountId=account_id, accountName=account_name)
             except iam_root.exceptions.NoSuchEntityException:
@@ -162,9 +162,9 @@ mainSteps:
 
             # Delete access keys
             try:
-                keys = iam_root.list_access_keys(UserName="root")["AccessKeyMetadata"]
+                keys = iam_root.list_access_keys()["AccessKeyMetadata"]
                 for key in keys:
-                    iam_root.delete_access_key(UserName="root", AccessKeyId=key["AccessKeyId"])
+                    iam_root.delete_access_key(AccessKeyId=key["AccessKeyId"])
                     results["accessKeysDeleted"] += 1
                 if keys:
                     log(run_id, "root_access_keys_deleted", accountId=account_id, accountName=account_name, count=len(keys))
@@ -175,9 +175,9 @@ mainSteps:
 
             # Delete signing certificates
             try:
-                certs = iam_root.list_signing_certificates(UserName="root")["Certificates"]
+                certs = iam_root.list_signing_certificates()["Certificates"]
                 for cert in certs:
-                    iam_root.delete_signing_certificate(UserName="root", CertificateId=cert["CertificateId"])
+                    iam_root.delete_signing_certificate(CertificateId=cert["CertificateId"])
                     results["signingCertsDeleted"] += 1
                 if certs:
                     log(run_id, "root_signing_certs_deleted", accountId=account_id, accountName=account_name, count=len(certs))
@@ -188,9 +188,9 @@ mainSteps:
 
             # Deactivate and delete MFA devices
             try:
-                mfa_devices = iam_root.list_mfa_devices(UserName="root")["MFADevices"]
+                mfa_devices = iam_root.list_mfa_devices()["MFADevices"]
                 for device in mfa_devices:
-                    iam_root.deactivate_mfa_device(UserName="root", SerialNumber=device["SerialNumber"])
+                    iam_root.deactivate_mfa_device(SerialNumber=device["SerialNumber"])
                     try:
                         iam_root.delete_virtual_mfa_device(SerialNumber=device["SerialNumber"])
                     except Exception:
