@@ -29,21 +29,21 @@ Before running these automations, the following should already be true:
 
 Runbooks:
 
-- [Bootstrap-STDB-Organization.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Bootstrap-STDB-Organization.yaml)
-- [Validate-Config.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Validate-Config.yaml)
-- [Discover-Root.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Discover-Root.yaml)
-- [Ensure-OUs.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Ensure-OUs.yaml)
-- [Create-Accounts.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Create-Accounts.yaml)
-- [Wait-For-Account-Creation.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Wait-For-Account-Creation.yaml)
-- [Move-Accounts-To-OUs.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Move-Accounts-To-OUs.yaml)
-- [Create-Bootstrap-Role.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Create-Bootstrap-Role.yaml)
-- [Secure-Root-Access.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Secure-Root-Access.yaml)
-- [Enable-Account-Regions.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Enable-Account-Regions.yaml)
-- [Verify-Bootstrap.yaml](/Users/krishnansubramanian/Documents/New%20project/ssm/Verify-Bootstrap.yaml)
+- [Bootstrap-STDB-Organization.yaml](Bootstrap-STDB-Organization.yaml)
+- [Validate-Config.yaml](Validate-Config.yaml)
+- [Discover-Root.yaml](Discover-Root.yaml)
+- [Ensure-OUs.yaml](Ensure-OUs.yaml)
+- [Create-Accounts.yaml](Create-Accounts.yaml)
+- [Wait-For-Account-Creation.yaml](Wait-For-Account-Creation.yaml)
+- [Move-Accounts-To-OUs.yaml](Move-Accounts-To-OUs.yaml)
+- [Create-Bootstrap-Role.yaml](Create-Bootstrap-Role.yaml)
+- [Secure-Root-Access.yaml](Secure-Root-Access.yaml)
+- [Enable-Account-Regions.yaml](Enable-Account-Regions.yaml)
+- [Verify-Bootstrap.yaml](Verify-Bootstrap.yaml)
 
 Sample config:
 
-- [examples/stdb-org-bootstrap-config.json](/Users/krishnansubramanian/Documents/New%20project/ssm/examples/stdb-org-bootstrap-config.json)
+- [examples/stdb-org-bootstrap-config.json](examples/stdb-org-bootstrap-config.json)
 
 ## Account Email Model
 

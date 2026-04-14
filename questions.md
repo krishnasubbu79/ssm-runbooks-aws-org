@@ -49,8 +49,8 @@ Ask AWS to include specialists or SMEs for:
 Suggested pre-read for AWS:
 
 - original STDB / Data Bunker architecture diagram
-- [aws-review-questionnaire-vault-ou.md](/Users/krishnansubramanian/Documents/New%20project/LZ/aws-review-questionnaire-vault-ou.md)
-- [backup-vault-cmk-strategy.md](/Users/krishnansubramanian/Documents/New%20project/ssm/backup-vault-cmk-strategy.md)
+- [aws-review-questionnaire-vault-ou.md](../LZ/aws-review-questionnaire-vault-ou.md)
+- [backup-vault-cmk-strategy.md](backup-vault-cmk-strategy.md)
 - current account / OU model
 - intended POC objective
 

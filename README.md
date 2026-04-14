@@ -104,7 +104,7 @@ The master org config is expected at a parameter such as:
 
 It should follow the lean v1 schema documented in:
 
-- [STDB-org-bootstrap-approach.md](/Users/krishnansubramanian/Documents/New%20project/STDB-org-bootstrap-approach.md)
+- [STDB-org-bootstrap-approach.md](../STDB-org-bootstrap-approach.md)
 
 ## Runbooks
 
@@ -122,8 +122,8 @@ It should follow the lean v1 schema documented in:
 
 ## Operating Guides
 
-- [ROOT-EMAIL-UPDATE.md](/Users/krishnansubramanian/Documents/New%20project/ssm/ROOT-EMAIL-UPDATE.md) — explains how to update root user / primary email addresses for member accounts after creation.
-- [backup-vault-cmk-strategy.md](/Users/krishnansubramanian/Documents/New%20project/ssm/backup-vault-cmk-strategy.md) — captures the STDB-owned CMK strategy for Prod-hosted AWS Backup logically air-gapped vaults.
+- [ROOT-EMAIL-UPDATE.md](ROOT-EMAIL-UPDATE.md) — explains how to update root user / primary email addresses for member accounts after creation.
+- [backup-vault-cmk-strategy.md](backup-vault-cmk-strategy.md) — captures the STDB-owned CMK strategy for Prod-hosted AWS Backup logically air-gapped vaults.
 
 ## Notes
 
