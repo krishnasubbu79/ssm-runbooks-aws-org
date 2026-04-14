@@ -77,7 +77,8 @@ aws ssm put-parameter \
 
 | Role / User | Where It Lives | Created By | Purpose |
 |---|---|---|---|
-| `<AUTOMATION_ROLE_NAME>` | Management account | You (Step 2 below) | The IAM role that SSM Automation assumes to execute the runbooks. Trusted by `ssm.amazonaws.com`. |
+| `<AUTOMATION_ROLE_NAME>` | Management account | You (Step 2 below) | The IAM role that SSM Automation assumes for all bootstrap runbooks. Trusted by `ssm.amazonaws.com`. No root permissions. |
+| `STDBSecureRootRole` | Management account | You (Step 2e below) | Dedicated role used **only** by `Secure-Root-Access`. Holds `sts:AssumeRoot` scoped to `IAMDeleteRootUserCredentials`. Isolated to prevent any other automation inheriting root-level access. |
 | `OrganizationAccountAccessRole` | Each child account | AWS automatically during `CreateAccount` | The default cross-account role AWS creates in every new account. The automation role assumes this to reach into child accounts. |
 | `STDBBootstrapRole` | Each child account | The `Create-Bootstrap-Role` runbook (Step 8) | A bootstrap role trusted by the management account. Used for landing zone deployment into child accounts. |
 | `STDBBootstrapRole` | Management account | The `Setup-Terraform-Local-Foundation` runbook (Step 15) | Same bootstrap role, created in the management account so Terraform has a uniform assume-role pattern across all accounts. |
@@ -181,16 +182,76 @@ cat > /tmp/ssm-automation-permissions.json << EOF
       "Resource": "arn:aws:iam::*:role/STDBBootstrapRole"
     },
     {
-      "Sid": "CloudWatchLogsAccess",
+      "Sid": "CloudWatchLogsDiscovery",
       "Effect": "Allow",
       "Action": [
         "logs:CreateLogGroup",
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogsWriteAccess",
+      "Effect": "Allow",
+      "Action": [
         "logs:CreateLogStream",
-        "logs:DescribeLogGroups",
         "logs:DescribeLogStreams",
         "logs:PutLogEvents"
       ],
-      "Resource": "arn:aws:logs:*:<MANAGEMENT_ACCOUNT_ID>:log-group:/stdb/ssm/automation/*"
+      "Resource": [
+        "arn:aws:logs:<REGION>:<MANAGEMENT_ACCOUNT_ID>:log-group:/stdb/ssm/automation/executeScript",
+        "arn:aws:logs:<REGION>:<MANAGEMENT_ACCOUNT_ID>:log-group:/stdb/ssm/automation/executeScript:log-stream:*"
+      ]
+    },
+  ]
+}
+EOF
+```
+
+### 2d. Attach the bootstrap permissions policy
+
+```bash
+aws iam put-role-policy \
+  --profile orga \
+  --role-name <AUTOMATION_ROLE_NAME> \
+  --policy-name "STDBBootstrapAutomationPolicy" \
+  --policy-document file:///tmp/ssm-automation-permissions.json
+```
+
+---
+
+## 2e. Create the Secure Root Role
+
+`Secure-Root-Access` uses a dedicated role (`STDBSecureRootRole`) that is separate from the main bootstrap automation role. This isolates `sts:AssumeRoot` — the most powerful permission in the org — so that no other runbook or automation can accidentally inherit it. The bootstrap role has no root permissions at all.
+
+### 2e. Create the STDBSecureRootRole
+
+```bash
+aws iam create-role \
+  --profile orga \
+  --role-name "STDBSecureRootRole" \
+  --assume-role-policy-document file:///tmp/ssm-automation-trust-policy.json \
+  --description "Dedicated SSM Automation role for Secure-Root-Access runbook only. Holds sts:AssumeRoot scoped to IAMDeleteRootUserCredentials."
+```
+
+### 2f. Create the secure root permissions policy file
+
+```bash
+cat > /tmp/ssm-secure-root-permissions.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SSMParameterAccess",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter"],
+      "Resource": "arn:aws:ssm:*:<MANAGEMENT_ACCOUNT_ID>:parameter/stdb/org/bootstrap/*"
+    },
+    {
+      "Sid": "OrganizationsReadForAccountResolution",
+      "Effect": "Allow",
+      "Action": ["organizations:ListAccounts"],
+      "Resource": "*"
     },
     {
       "Sid": "CentralizedRootAccessManagement",
@@ -208,24 +269,44 @@ cat > /tmp/ssm-automation-permissions.json << EOF
       "Sid": "AssumeRootForCredentialRemoval",
       "Effect": "Allow",
       "Action": "sts:AssumeRoot",
-      "Resource": "arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:root"
+      "Resource": "arn:aws:iam::*:root",
+      "Condition": {
+        "StringEquals": {
+          "sts:TaskPolicyArn": "arn:aws:iam::aws:policy/root-task/IAMDeleteRootUserCredentials"
+        }
+      }
+    },
+    {
+      "Sid": "CloudWatchLogsWriteAccess",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:<REGION>:<MANAGEMENT_ACCOUNT_ID>:log-group:/stdb/ssm/automation/executeScript",
+        "arn:aws:logs:<REGION>:<MANAGEMENT_ACCOUNT_ID>:log-group:/stdb/ssm/automation/executeScript:log-stream:*"
+      ]
     }
   ]
 }
 EOF
 ```
 
-### 2d. Attach the bootstrap permissions policy
+### 2g. Attach the secure root permissions policy
 
 ```bash
 aws iam put-role-policy \
   --profile orga \
-  --role-name <AUTOMATION_ROLE_NAME> \
-  --policy-name "STDBBootstrapAutomationPolicy" \
-  --policy-document file:///tmp/ssm-automation-permissions.json
+  --role-name "STDBSecureRootRole" \
+  --policy-name "STDBSecureRootPolicy" \
+  --policy-document file:///tmp/ssm-secure-root-permissions.json
 ```
 
-### 2e. Create the automation execution permissions policy
+---
+
+### 2h. Create the automation execution permissions policy
 
 The parent orchestrator uses `aws:executeAutomation` to launch child runbooks. This requires `ssm:StartAutomationExecution` and the ability to pass the automation role to the child executions via `iam:PassRole`.
 
@@ -251,7 +332,10 @@ cat > /tmp/ssm-automation-execution-permissions.json << 'EOF'
       "Sid": "PassRoleToAutomation",
       "Effect": "Allow",
       "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/<AUTOMATION_ROLE_NAME>",
+      "Resource": [
+        "arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/<AUTOMATION_ROLE_NAME>",
+        "arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/STDBSecureRootRole"
+      ],
       "Condition": {
         "StringEquals": {
           "iam:PassedToService": "ssm.amazonaws.com"
@@ -263,7 +347,7 @@ cat > /tmp/ssm-automation-execution-permissions.json << 'EOF'
 EOF
 ```
 
-### 2f. Attach the automation execution permissions policy
+### 2i. Attach the automation execution permissions policy to both roles
 
 ```bash
 aws iam put-role-policy \
@@ -271,9 +355,15 @@ aws iam put-role-policy \
   --role-name <AUTOMATION_ROLE_NAME> \
   --policy-name "STDBAutomationExecutionPolicy" \
   --policy-document file:///tmp/ssm-automation-execution-permissions.json
+
+aws iam put-role-policy \
+  --profile orga \
+  --role-name "STDBSecureRootRole" \
+  --policy-name "STDBAutomationExecutionPolicy" \
+  --policy-document file:///tmp/ssm-automation-execution-permissions.json
 ```
 
-### 2g. Verify the role
+### 2j. Verify both roles
 
 ```bash
 aws iam get-role \
@@ -281,9 +371,15 @@ aws iam get-role \
   --role-name <AUTOMATION_ROLE_NAME> \
   --query "Role.Arn" \
   --output text
+
+aws iam get-role \
+  --profile orga \
+  --role-name "STDBSecureRootRole" \
+  --query "Role.Arn" \
+  --output text
 ```
 
-Save this ARN — it is the `AutomationAssumeRole` value for all runbook executions.
+Save both ARNs. The bootstrap role ARN is the `AutomationAssumeRole` for all bootstrap runbooks. The `STDBSecureRootRole` ARN is used exclusively for the `Secure-Root-Access` runbook.
 
 ---
 
@@ -292,6 +388,8 @@ Save this ARN — it is the `AutomationAssumeRole` value for all runbook executi
 SSM Automation `aws:executeScript` steps can send their `print()` output to CloudWatch Logs. This is an account-level service setting — once enabled, all automation executions in the account will log to the configured log group.
 
 The runbooks use structured JSON logging with a correlation ID (`RunId`) so you can trace a complete bootstrap run across all child executions using CloudWatch Logs Insights.
+
+SSM Automation creates the log streams from the `aws:executeScript` step output. The runbook Python code does not create CloudWatch log streams directly. The `AutomationAssumeRole` therefore needs CloudWatch Logs permissions that cover both the log group ARN and the log stream ARN (`:log-stream:*`), as shown in the role policy in Step 2.
 
 ### 3a. Create the CloudWatch log group
 
@@ -713,13 +811,15 @@ done
 
 ### 9a. Enable centralized root access and remove root credentials
 
+> **Note:** This runbook uses `STDBSecureRootRole` — not the bootstrap automation role. The `sts:AssumeRoot` permission is isolated to this dedicated role and is not present on the main automation role.
+
 ```bash
 aws ssm start-automation-execution \
   --profile orga \
   --region <REGION> \
   --document-name "Secure-Root-Access" \
   --parameters \
-    "AutomationAssumeRole=arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/<AUTOMATION_ROLE_NAME>,ConfigParameterName=/stdb/org/bootstrap/config"
+    "AutomationAssumeRole=arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/STDBSecureRootRole,ConfigParameterName=/stdb/org/bootstrap/config"
 ```
 
 ### 9b. Verify the execution
